@@ -55,7 +55,11 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.printf("Connecting to %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (WIFI_CHANNEL >= 0) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
+  } else {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
