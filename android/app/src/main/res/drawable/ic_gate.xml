@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stylized icon of a barred gate -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?android:attr/colorControlNormal">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M3,5h2v14h-2z M8,5h2v14h-2z M14,5h2v14h-2z M19,5h2v14h-2z M3,8.5h18v2h-18z M3,14.5h18v2h-18z" />
+</vector>

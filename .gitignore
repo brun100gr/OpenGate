@@ -1,0 +1,16 @@
+# Local secrets — never commit these (copy the .example templates instead)
+android/app/src/main/java/com/opengate/Config.kt
+esp32/opengate/secrets.h
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+*.apk
+*.aab
+
+# Misc
+.DS_Store

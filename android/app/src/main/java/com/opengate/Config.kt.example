@@ -1,0 +1,20 @@
+package com.opengate
+
+/**
+ * MQTT configuration TEMPLATE.
+ *
+ * Copy this file to Config.kt (same folder), then fill in the real values.
+ * Config.kt is gitignored so your credentials never reach the repository.
+ */
+object Config {
+    /** Broker URI, ssl:// scheme for TLS on port 8883. */
+    const val BROKER_URI = "ssl://XXXXXXXX.s1.eu.hivemq.cloud:8883"
+
+    /** Credentials created in HiveMQ Cloud > Access Management. */
+    const val USERNAME = "opengate-app"
+    const val PASSWORD = "CHANGE_ME"
+
+    /** Topic and payload the ESP32 expects. */
+    const val TOPIC = "opengate/cmd"
+    const val COMMAND = "open"
+}

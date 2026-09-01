@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenGate</string>
+    <string name="open_gate">Open gate</string>
+    <string name="press_to_open">Press to open the gate</string>
+    <string name="sending">Sending command…</string>
+    <string name="sent_ok">Command sent ✓</string>
+    <string name="sent_error">Error: %1$s</string>
+    <string name="sent_error_short">Send failed</string>
+</resources>
