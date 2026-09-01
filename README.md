@@ -82,7 +82,10 @@ Apps not coming from the Play Store must be explicitly enabled:
 1. In the Arduino IDE install the ESP32 board support (*Boards Manager* →
    "esp32" by Espressif) and the **PubSubClient** library (Nick O'Leary).
 2. In `esp32/opengate/`, copy `secrets.h.example` to `secrets.h` and fill it
-   in: WiFi SSID/password, HiveMQ hostname, `opengate-esp32` credentials.
+   in: WiFi SSID/password, and credentials for both your **test** and
+   **production** HiveMQ clusters. At the top of `secrets.h`, choose your
+   environment by setting `#define ENVIRONMENT_TEST` (default) or
+   `#define ENVIRONMENT_PROD`.
 3. Upload the sketch and open the serial monitor at 115200 baud: it should
    print `WiFi OK`, `Connecting to MQTT... OK`, `Subscribed to opengate/cmd`.
 
