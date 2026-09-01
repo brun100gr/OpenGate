@@ -52,8 +52,10 @@ the proper SDK and JDK on its own).
    On first import Gradle downloads the dependencies and, if the wrapper jar
    is missing, Android Studio offers to regenerate it: accept.
 2. In `app/src/main/java/com/opengate/`, copy `Config.kt.example` to
-   `Config.kt` and fill in the cluster hostname and the `opengate-app`
-   credentials.
+   `Config.kt` and fill in the credentials for both your **test** and
+   **production** HiveMQ brokers. At the top of `Config.kt`, choose your
+   environment by setting `IS_TEST = true` (default) or `IS_TEST = false`
+   for production.
 3. Connect the phone via USB (with **USB debugging** enabled in developer
    options) and press **Run ▶**. The app appears on the phone: a single
    "Open gate" button.

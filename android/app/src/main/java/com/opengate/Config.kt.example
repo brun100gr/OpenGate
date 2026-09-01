@@ -5,14 +5,33 @@ package com.opengate
  *
  * Copy this file to Config.kt (same folder), then fill in the real values.
  * Config.kt is gitignored so your credentials never reach the repository.
+ *
+ * Switch between TEST and PRODUCTION by changing IS_TEST below.
  */
 object Config {
-    /** Broker URI, ssl:// scheme for TLS on port 8883. */
-    const val BROKER_URI = "ssl://XXXXXXXX.s1.eu.hivemq.cloud:8883"
+    // ============ ENVIRONMENT SWITCH ============
+    private const val IS_TEST = true  // Change to false for production
+    // =============================================
 
-    /** Credentials created in HiveMQ Cloud > Access Management. */
-    const val USERNAME = "opengate-app"
-    const val PASSWORD = "CHANGE_ME"
+    // Test broker credentials
+    private const val BROKER_URI_TEST = "ssl://test-broker.s1.eu.hivemq.cloud:8883"
+    private const val USERNAME_TEST = "opengate-app"
+    private const val PASSWORD_TEST = "TEST_PASSWORD_HERE"
+
+    // Production broker credentials
+    private const val BROKER_URI_PROD = "ssl://prod-broker.s1.eu.hivemq.cloud:8883"
+    private const val USERNAME_PROD = "opengate-app"
+    private const val PASSWORD_PROD = "PROD_PASSWORD_HERE"
+
+    // Active broker (selected by IS_TEST)
+    val BROKER_URI: String
+        get() = if (IS_TEST) BROKER_URI_TEST else BROKER_URI_PROD
+
+    val USERNAME: String
+        get() = if (IS_TEST) USERNAME_TEST else USERNAME_PROD
+
+    val PASSWORD: String
+        get() = if (IS_TEST) PASSWORD_TEST else PASSWORD_PROD
 
     /** Topic and payload the ESP32 expects. */
     const val TOPIC = "opengate/cmd"
