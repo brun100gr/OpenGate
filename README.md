@@ -26,6 +26,27 @@ gitignored, and only `.example` templates are committed.
 After cloning, copy each template next to itself, dropping the `.example`
 suffix, and fill in your values. The project does not build until you do.
 
+### Environment Switching (Test ↔ Production)
+
+Both `Config.kt` (Android) and `secrets.h` (ESP32) support switching between
+test and production brokers **without changing any code**:
+
+**Android (`Config.kt`)**:
+```kotlin
+private const val IS_TEST = true  // Change to false for production
+```
+
+**ESP32 (`secrets.h`)**:
+```c
+#define ENVIRONMENT_TEST
+// #define ENVIRONMENT_PROD
+```
+
+Both test and production credentials are baked into the files (which are
+gitignored). Simply flip the flag, recompile, and the app or sketch connects
+to the other broker. Useful for validating changes in a test environment
+before deploying to production.
+
 ---
 
 ## 1. MQTT broker (HiveMQ Cloud)
@@ -121,7 +142,70 @@ terminals where a wall button or a key switch would be wired. The 1 s pulse
 manual for which terminal pair is the button input: they are extra-low
 voltage contacts, but wiring the wrong terminals can damage the board.
 
-## 4. End-to-end test
+## 4. Android Auto UI
+
+To test the Android Auto UI without a physical vehicle, use the **Desktop Head Unit (DHU)** — Google's official emulator that runs on your PC (Windows, macOS, or Linux) and simulates the car screen, communicating with your phone via USB or ADB.
+
+### Setup
+
+**Option A: Direct DHU (requires GLIBC 2.32+)**
+
+1. **Install DHU** in Android Studio:
+   - Open *Settings → Languages & Frameworks → Android SDK → SDK Tools*
+   - Find and install *Android Auto Desktop Head Unit Emulator*
+   - The executable lands in `[SDK_PATH]/extras/google/auto/`
+
+2. **Prepare the phone**:
+   - Open *Android Auto settings* (search in phone settings or open the Android Auto app)
+   - Scroll to the bottom and tap **Version** 10 times to unlock developer settings
+   - Open the menu ⋮ and select **Start head unit server**
+   - You should see a persistent notification: "Head unit server running"
+
+3. **Connect and launch**:
+   - Connect the phone to your PC via USB
+   - Open a terminal and set up ADB port forwarding:
+     ```sh
+     ~/Android/Sdk/platform-tools/adb forward tcp:5277 tcp:5277
+     ```
+   - Run the DHU from the SDK folder:
+     ```sh
+     # macOS/Linux
+     ./desktop-head-unit
+     ```
+
+**Option B: DHU via Docker (recommended for Ubuntu 20.04 or older)**
+
+If your system lacks GLIBC 2.32+:
+
+1. **Create a Dockerfile** in the DHU directory (`[SDK_PATH]/extras/google/auto/`):
+   ```dockerfile
+   FROM ubuntu:22.04
+   RUN apt-get update && apt-get install -y \
+       libc++1 libc++abi1 libusb-1.0-0 \
+       libsdl2-2.0-0 libsdl2-ttf-2.0-0 libportaudio2 libpng16-16 x11-apps
+   WORKDIR /dhu
+   ENTRYPOINT ["./desktop-head-unit"]
+   ```
+
+2. **Build the image**:
+   ```sh
+   docker build -t android-dhu .
+   ```
+
+3. **Run via Docker** (enable X11 display):
+   ```sh
+   xhost +local:docker
+   docker run -it --rm \
+       -e DISPLAY=$DISPLAY \
+       -v /tmp/.X11-unix:/tmp/.X11-unix \
+       -v $(pwd):/dhu \
+       --net=host --privileged \
+       android-dhu
+   ```
+
+The phone and DHU should auto-connect; you'll see the OpenGate grid with the "Open gate" button on the emulated car screen.
+
+## 5. End-to-end test
 
 1. ESP32 powered and connected (serial monitor open).
 2. From the phone app press **Open gate** → the app shows "Command sent ✓",
@@ -138,7 +222,7 @@ mosquitto_pub -h YOUR_CLUSTER.s1.eu.hivemq.cloud -p 8883 \
   -t opengate/cmd -m open
 ```
 
-## 5. Security notes
+## 6. Security notes
 
 This command opens your home, so:
 
