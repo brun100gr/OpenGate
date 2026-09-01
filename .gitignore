@@ -2,15 +2,17 @@
 android/app/src/main/java/com/opengate/Config.kt
 esp32/opengate/secrets.h
 
-# Android
+# Android build cache and machine-specific config
 android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
 android/.idea/
 android/captures/
+android/gradle/gradle-daemon-jvm.properties
 *.apk
 *.aab
 
 # Misc
 .DS_Store
+

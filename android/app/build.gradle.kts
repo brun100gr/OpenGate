@@ -33,7 +33,7 @@ android {
 
 dependencies {
     // Car App Library for Android Auto (apps "projected" onto the car screen)
-    implementation("androidx.car.app:app-projected:1.4.0")
+    implementation("androidx.car.app:app:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")
     // Eclipse Paho Java MQTT client, used directly (without the deprecated
     // Android service): more than enough for a simple publish
