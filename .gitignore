@@ -1,6 +1,6 @@
 # Local secrets — never commit these (copy the .example templates instead)
 android/app/src/main/java/com/opengate/Config.kt
-esp32/opengate/secrets.h
+esp32/opengate/src/secrets.h
 
 # Android build cache and machine-specific config
 android/.gradle/
@@ -13,6 +13,15 @@ android/gradle/gradle-daemon-jvm.properties
 *.apk
 *.aab
 
+# Kotlin compiler cache  
+android/.kotlin/
+
 # Misc
 .DS_Store
 
+# Platform.io cache
+esp32/opengate/.pio/
+
+# VSCode auto-generated C++ properties
+esp32/opengate/.vscode/c_cpp_properties.json
+esp32/opengate/.vscode/launch.json
