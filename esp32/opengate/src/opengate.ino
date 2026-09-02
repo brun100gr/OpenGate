@@ -35,7 +35,7 @@ const unsigned long PULSE_MS = 1000;
 const uint64_t DEEP_SLEEP_DURATION_US = 2ULL * 60 * 1000000;
 
 // MQTT awake timeout: wait this long for a message during wake
-const unsigned long MQTT_AWAKE_TIMEOUT_MS = 5000;
+const unsigned long MQTT_AWAKE_TIMEOUT_MS = 10000;
 
 // Maximum number of processed command IDs to store
 const int MAX_PROCESSED_IDS = 20;
@@ -88,7 +88,7 @@ void saveProcessedId(const String& id) {
   }
 
   nvs.putString("cmd_ids", ids);
-  Serial.printf("[NVS] Processed IDs saved: %s\n", ids.c_str());
+  Serial.printf("[NVS] Processed IDs saved: %s\r\n", ids.c_str());
 }
 
 void saveWiFiInfo() {
@@ -154,8 +154,24 @@ void pulseRelay() {
 
 // ===================== MQTT ===================================
 
+const char* getMqttStateString(int state) {
+  switch (state) {
+    case -4: return "MQTT_CONNECT_FAILED";
+    case -3: return "MQTT_CONNECTION_REFUSED";
+    case -2: return "MQTT_CONNECTION_LOST";
+    case -1: return "MQTT_DISCONNECTED";
+    case 0:  return "MQTT_CONNECTED";
+    case 1:  return "MQTT_CONNECT_BAD_PROTOCOL";
+    case 2:  return "MQTT_CONNECT_BAD_CLIENT_ID";
+    case 3:  return "MQTT_CONNECT_UNAVAILABLE";
+    case 4:  return "MQTT_CONNECT_BAD_CREDENTIALS";
+    case 5:  return "MQTT_CONNECT_UNAUTHORIZED";
+    default: return "MQTT_UNKNOWN";
+  }
+}
+
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  Serial.printf("[MQTT] Message on %s (%u bytes)\n", topic, length);
+  Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
 
   // Log raw payload
   char rawPayload[512];
@@ -164,7 +180,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   } else {
     memcpy(rawPayload, payload, length);
     rawPayload[length] = '\0';
-    Serial.printf("[MQTT] Raw payload: %s\n", rawPayload);
+    Serial.printf("[MQTT] Raw payload: %s\r\n", rawPayload);
   }
 
   Message msg = parseMessage(payload, length);
@@ -176,11 +192,11 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String id(msg.id);
   String command(msg.command);
 
-  Serial.printf("[MSG] id=%s, command=%s\n", msg.id, msg.command);
+  Serial.printf("[MSG] id=%s, command=%s\r\n", msg.id, msg.command);
 
   // Deduplication check
   if (hasProcessedId(id)) {
-    Serial.printf("[CMD] DUPLICATE id=%s\n", msg.id);
+    Serial.printf("[CMD] DUPLICATE id=%s\r\n", msg.id);
     publishAck(id, "DUPLICATE");
   } else if (command == "OPEN") {
     Serial.println("[CMD] Executing OPEN");
@@ -188,7 +204,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     saveProcessedId(id);
     publishAck(id, "OK");
   } else {
-    Serial.printf("[CMD] Unknown command: %s\n", msg.command);
+    Serial.printf("[CMD] Unknown command: %s\r\n", msg.command);
     publishAck(id, "UNKNOWN_COMMAND");
   }
 
@@ -207,10 +223,10 @@ void connectWiFi() {
   WiFi.mode(WIFI_STA);
 
   if (savedSsid.length() > 0 && savedChannel > 0) {
-    Serial.printf("[WiFi] Connecting to %s (cached channel %d)\n", savedSsid.c_str(), savedChannel);
+    Serial.printf("[WiFi] Connecting to %s (cached channel %d)\r\n", savedSsid.c_str(), savedChannel);
     WiFi.begin(savedSsid.c_str(), WIFI_PASSWORD, savedChannel);
   } else {
-    Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+    Serial.printf("[WiFi] Connecting to %s\r\n", WIFI_SSID);
     if (WIFI_CHANNEL >= 0) {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
     } else {
@@ -225,10 +241,10 @@ void connectWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\r\n[WiFi] Connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
     saveWiFiInfo();
   } else {
-    Serial.println("\n[WiFi] Connection timeout");
+    Serial.println("\r\n[WiFi] Connection timeout");
   }
 }
 
@@ -237,22 +253,31 @@ void connectMqtt() {
   const int MAX_ATTEMPTS = 3;
 
   while (!mqtt.connected() && attempts < MAX_ATTEMPTS) {
-    Serial.printf("[MQTT] Connecting (attempt %d/%d)\n", attempts + 1, MAX_ATTEMPTS);
+    Serial.printf("[MQTT] Connecting (attempt %d/%d)...\r\n", attempts + 1, MAX_ATTEMPTS);
 
     if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-      Serial.println("[MQTT] Connected");
-      mqtt.subscribe(MQTT_CMD_TOPIC, 1);  // QoS 1
-      Serial.printf("[MQTT] Subscribed to %s\n", MQTT_CMD_TOPIC);
+      Serial.println("[MQTT] Connected to broker");
+
+      // Subscribe with QoS 1
+      if (mqtt.subscribe(MQTT_CMD_TOPIC, 1)) {
+        Serial.printf("[MQTT] Successfully subscribed to %s (QoS 1)\r\n", MQTT_CMD_TOPIC);
+      } else {
+        Serial.printf("[MQTT] ERROR: Failed to subscribe to %s\r\n", MQTT_CMD_TOPIC);
+      }
+
       return;
     }
 
-    Serial.printf("[MQTT] Connection failed (rc=%d)\n", mqtt.state());
+    int rc = mqtt.state();
+    Serial.printf("[MQTT] Connection failed (state=%d, rc=%s)\r\n", rc, getMqttStateString(rc));
     attempts++;
-    delay(1000);
+    if (attempts < MAX_ATTEMPTS) {
+      delay(1000);
+    }
   }
 
   if (!mqtt.connected()) {
-    Serial.println("[MQTT] Failed to connect after retries");
+    Serial.println("[MQTT] ERROR: Failed to connect after all retry attempts");
   }
 }
 
@@ -275,7 +300,7 @@ void publishAck(const String& id, const String& result) {
            id.c_str(), result.c_str(), timestamp);
 
   if (mqtt.publish(MQTT_ACK_TOPIC, payload, 1)) {  // QoS 1
-    Serial.printf("[ACK] Published: %s\n", payload);
+    Serial.printf("[ACK] Published: %s\r\n", payload);
   } else {
     Serial.println("[ACK] Failed to publish");
   }
@@ -290,14 +315,14 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  Serial.println("\n================== ESP32 WAKE UP ==================");
+  Serial.println("\r\n================== ESP32 WAKE UP ==================");
 
   // Initialize NVS
   nvsInit();
 
   // Generate stable client ID from MAC
   clientId = "opengate-esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  Serial.printf("[Init] Client ID: %s\n", clientId.c_str());
+  Serial.printf("[Init] Client ID: %s\r\n", clientId.c_str());
 
   // Connect to WiFi
   connectWiFi();
@@ -317,37 +342,49 @@ void setup() {
   // Connect to MQTT
   connectMqtt();
 
-  // Wait for message with timeout
-  messageProcessed = false;
-  unsigned long startTime = millis();
+  // Verify MQTT connection before waiting for messages
+  if (!mqtt.connected()) {
+    Serial.println("[MQTT] ERROR: Not connected to MQTT broker, skipping wait");
+  } else {
+    // Wait for message with timeout
+    messageProcessed = false;
+    unsigned long startTime = millis();
+    unsigned long loopCount = 0;
 
-  Serial.printf("[MQTT] Waiting for command (timeout=%lu ms)\n", MQTT_AWAKE_TIMEOUT_MS);
+    Serial.printf("[MQTT] Waiting for command (timeout=%lu ms)\r\n", MQTT_AWAKE_TIMEOUT_MS);
 
-  while (millis() - startTime < MQTT_AWAKE_TIMEOUT_MS) {
-    if (mqtt.connected()) {
-      mqtt.loop();
-      if (messageProcessed) {
+    while (millis() - startTime < MQTT_AWAKE_TIMEOUT_MS) {
+      if (mqtt.connected()) {
+        mqtt.loop();
+        loopCount++;
+        if (messageProcessed) {
+          break;
+        }
+      } else {
+        Serial.println("[MQTT] Connection lost during wait");
         break;
       }
+      delay(50);
     }
-    delay(50);
-  }
 
-  if (!messageProcessed) {
-    Serial.println("[MSG] No command received");
-  }
+    Serial.printf("[MQTT] Wait ended after %lu ms (%lu loops)\r\n", millis() - startTime, loopCount);
 
-  // Disconnect MQTT gracefully
-  if (mqtt.connected()) {
-    mqtt.disconnect();
-    Serial.println("[MQTT] Disconnected");
+    if (!messageProcessed) {
+      Serial.println("[MSG] No command received");
+    }
+
+    // Disconnect MQTT gracefully
+    if (mqtt.connected()) {
+      mqtt.disconnect();
+      Serial.println("[MQTT] Disconnected");
+    }
   }
 
   // Close NVS
   nvs.end();
 
   // Enter deep sleep
-  Serial.printf("\n[Sleep] Going to deep sleep for 2 minutes...\n");
+  Serial.printf("\r\n[Sleep] Going to deep sleep for 2 minutes...\r\n");
   Serial.flush();
 
   esp_deep_sleep(DEEP_SLEEP_DURATION_US);
