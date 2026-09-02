@@ -1,6 +1,7 @@
 # Local secrets — never commit these (copy the .example templates instead)
 android/app/src/main/java/com/opengate/Config.kt
 esp32/opengate/src/secrets.h
+local/.env
 
 # Android build cache and machine-specific config
 android/.gradle/
@@ -25,3 +26,12 @@ esp32/opengate/.pio/
 # VSCode auto-generated C++ properties
 esp32/opengate/.vscode/c_cpp_properties.json
 esp32/opengate/.vscode/launch.json
+
+# Python virtual environment
+local/venv
+
+local/.venv/
+local/venv/
+local/__pycache__/
+local/*.py[cod]
+local/esp32_nvs_sim.json
