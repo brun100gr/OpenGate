@@ -157,6 +157,16 @@ void pulseRelay() {
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] Message on %s (%u bytes)\n", topic, length);
 
+  // Log raw payload
+  char rawPayload[512];
+  if (length >= sizeof(rawPayload)) {
+    Serial.println("[MQTT] Payload too large to log");
+  } else {
+    memcpy(rawPayload, payload, length);
+    rawPayload[length] = '\0';
+    Serial.printf("[MQTT] Raw payload: %s\n", rawPayload);
+  }
+
   Message msg = parseMessage(payload, length);
   if (!msg.valid) {
     Serial.println("[MSG] Missing id or command field");
