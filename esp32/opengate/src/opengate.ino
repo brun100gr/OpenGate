@@ -2,24 +2,43 @@
  * OpenGate — gate side (ESP32)
  *
  * Intermittently wakes from deep sleep (2 min intervals), connects to WiFi and MQTT,
- * waits for a command, executes it with command deduplication (NVS), publishes ACK,
- * and returns to deep sleep.
+ * waits for a command, executes it with durable command reservation/deduplication (NVS),
+ * publishes an MQTT ACK, sends a Telegram notification, and returns to deep sleep.
  *
  * MQTT uses a persistent session (clean-session=false) with a fixed client ID,
- * allowing commands published while offline to be delivered upon wake.
+ * allowing queued QoS 1 commands published while the ESP32 is offline to be
+ * delivered upon wake.
  *
- * Credentials and broker details live in secrets.h (gitignored): copy
+ * IMPORTANT:
+ * MQTT QoS 1 gives at-least-once delivery. The command transaction below therefore
+ * implements an AT-MOST-ONCE hardware action across resets:
+ *
+ *   1. Persist command as PENDING in NVS.
+ *   2. Activate the relay.
+ *   3. Persist command as PROCESSED and clear PENDING.
+ *   4. Publish ACK + Telegram notification.
+ *
+ * If the ESP32 resets after step 1, the command is deliberately NOT executed again
+ * on the next boot. Without a physical gate-position/relay feedback signal, it is
+ * impossible to know whether a reset happened before or after the relay pulse.
+ * This design therefore prefers preventing a possible second gate opening over
+ * guaranteeing that every command is eventually executed.
+ *
+ * Credentials and certificates live in secrets.h (gitignored): copy
  * secrets.h.example to secrets.h and fill in your values.
  *
  * Required libraries (Arduino IDE Library Manager):
  *   - PubSubClient (Nick O'Leary)
- * WiFi, WiFiClientSecure, and Preferences are included in the ESP32 core.
+ *   - UniversalTelegramBot
+ *   - WiFi, WiFiClientSecure, and Preferences are included in the ESP32 core.
  */
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <UniversalTelegramBot.h>
+#include <time.h>
 
 #include "secrets.h"
 
@@ -40,12 +59,89 @@ const unsigned long MQTT_AWAKE_TIMEOUT_MS = 10000;
 // Maximum number of processed command IDs to store
 const int MAX_PROCESSED_IDS = 20;
 
+// System time is required for certificate validity checks.
+const char* NTP_SERVER = "pool.ntp.org";
+const unsigned long TIME_SYNC_TIMEOUT_MS = 5000;
+const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; only used as a sanity check
+
+// Root CA used to validate api.telegram.org.
+// The currently observed api.telegram.org certificate chain is issued by
+// GoDaddy Secure Certificate Authority - G2, whose trust anchor is
+// Go Daddy Root Certificate Authority - G2. Keep this certificate in the
+// source tree because it is public CA material, not a secret.
+static const char TELEGRAM_ROOT_CA[] PROGMEM = R"EOF(-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIBADANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCVVMx
+EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxGjAYBgNVBAoT
+EUdvRGFkZHkuY29tLCBJbmMuMTEwLwYDVQQDEyhHbyBEYWRkeSBSb290IENlcnRp
+ZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5MDkwMTAwMDAwMFoXDTM3MTIzMTIz
+NTk1OVowgYMxCzAJBgNVBAYTAlVTMRAwDgYDVQQIEwdBcml6b25hMRMwEQYDVQQH
+EwpTY290dHNkYWxlMRowGAYDVQQKExFHb0RhZGR5LmNvbSwgSW5jLjExMC8GA1UE
+AxMoR28gRGFkZHkgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIw
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAL9xYgjx+lk09xvJGKP3gElY6SKD
+E6bFIEMBO4Tx5oVJnyfq9oQbTqC023CYxzIBsQU+B07u9PpPL1kwIuerGVZr4oAH
+/PMWdYA5UXvl+TW2dE6pjYIT5LY/qQOD+qK+ihVqf94Lw7YZFAXK6sOoBJQ7Rnwy
+DfMAZiLIjWltNowRGLfTshxgtDj6AozO091GB94KPutdfMh8+7ArU6SSYmlRJQVh
+GkSBjCypQ5Yj36w6gZoOKcUcqeldHraenjAKOc7xiID7S13MMuyFYkMlNAJWJwGR
+tDtwKj9useiciAF9n9T521NtYJ2/LOdYq7hfRvzOxBsDPAnrSTFcaUaz4EcCAwEA
+AaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYE
+FDqahQcQZyi27/a9BUFuIMGU2g/eMA0GCSqGSIb3DQEBCwUAA4IBAQCZ21151fmX
+WWcDYfF+OwYxdS2hII5PZYe096acvNjpL9DbWu7PdIxztDhC2gV7+AJ1uP2lsdeu
+9tfeE8tTEH6KRtGX+rcuKxGrkLAngPnon1rpN5+r5N9ss4UXnT3ZJE95kTXWXwTr
+gIOrmgIttRD02JDHBHNA7XIloKmf7J6raBKZV8aPEjoJpL1E/QYVN8Gb5DKj7Tjo
+2GTzLH4U/ALqn83/B2gX2yKQOC16jdFU8WnjXzPKej17CuPKf1855eJ1usV2GDPO
+LPAvTK33sefOT6jEm0pUBsV/fdUID+Ic/n4XuKxe9tQWskMJDE32p2u0mYRlynqI
+4uJEvlz36hz1
+-----END CERTIFICATE-----
+)EOF";
+
+// Broker root CA (for HiveMQ Cloud: Let's Encrypt "ISRG Root X1").
+// Paste the PEM certificate here — see README, "TLS certificate" section.
+// If you leave the placeholder, the sketch falls back to setInsecure():
+// the connection is encrypted but the server identity is NOT verified
+// (vulnerable to MITM).
+const char* ROOT_CA = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)EOF";
+
 // =================================================================
 
 WiFiClientSecure tlsClient;
 PubSubClient mqtt(tlsClient);
-Preferences nvs;
 
+WiFiClientSecure telegramClient;
+UniversalTelegramBot telegramBot(TELEGRAM_BOT_TOKEN, telegramClient);
+
+Preferences nvs;
 String clientId;
 volatile bool messageProcessed = false;
 
@@ -57,16 +153,27 @@ struct Message {
 
 // ============================= NVS ==============================
 
-void nvsInit() {
-  nvs.begin("opengate", false);
+bool nvsInit() {
+  if (!nvs.begin("opengate", false)) {
+    Serial.println("[NVS] ERROR: unable to open namespace");
+    return false;
+  }
+  return true;
 }
 
 bool hasProcessedId(const String& id) {
   String ids = nvs.getString("cmd_ids", "");
-  return ids.indexOf(id) != -1;
+  if (ids.isEmpty()) {
+    return false;
+  }
+
+  // IDs are stored as a comma-separated list. Search for a complete entry
+  // to avoid false positives from partial matches.
+  String list = "," + ids + ",";
+  return list.indexOf("," + id + ",") != -1;
 }
 
-void saveProcessedId(const String& id) {
+bool saveProcessedId(const String& id) {
   String ids = nvs.getString("cmd_ids", "");
 
   if (ids.length() > 0) {
@@ -75,7 +182,7 @@ void saveProcessedId(const String& id) {
     ids = id;
   }
 
-  // Keep only the last MAX_PROCESSED_IDS by counting backwards
+  // Keep only the last MAX_PROCESSED_IDS by counting backwards.
   int commaCount = 0;
   for (int i = ids.length() - 1; i >= 0; i--) {
     if (ids[i] == ',') {
@@ -87,8 +194,70 @@ void saveProcessedId(const String& id) {
     }
   }
 
-  nvs.putString("cmd_ids", ids);
+  size_t written = nvs.putString("cmd_ids", ids);
+  if (written == 0) {
+    Serial.println("[NVS] ERROR: failed to save processed command ID");
+    return false;
+  }
+
   Serial.printf("[NVS] Processed IDs saved: %s\r\n", ids.c_str());
+  return true;
+}
+
+bool reservePendingId(const String& id) {
+  String pending = nvs.getString("pending_id", "");
+
+  // If a different command is already pending, do not execute another hardware action.
+  if (!pending.isEmpty() && pending != id) {
+    Serial.printf("[NVS] ERROR: another command is pending: %s\r\n", pending.c_str());
+    return false;
+  }
+
+  if (pending == id) {
+    return true;
+  }
+
+  size_t written = nvs.putString("pending_id", id);
+  if (written == 0) {
+    Serial.println("[NVS] ERROR: failed to persist pending command");
+    return false;
+  }
+
+  // Read back to verify that the reservation is durable from our point of view.
+  String verify = nvs.getString("pending_id", "");
+  if (verify != id) {
+    Serial.println("[NVS] ERROR: pending command verification failed");
+    return false;
+  }
+
+  Serial.printf("[NVS] Command reserved as PENDING: %s\r\n", id.c_str());
+  return true;
+}
+
+bool clearPendingId(const String& expectedId) {
+  String pending = nvs.getString("pending_id", "");
+
+  if (pending.isEmpty()) {
+    return true;
+  }
+
+  if (pending != expectedId) {
+    Serial.printf("[NVS] ERROR: pending ID mismatch (stored=%s, expected=%s)\r\n",
+                  pending.c_str(), expectedId.c_str());
+    return false;
+  }
+
+  if (!nvs.remove("pending_id")) {
+    Serial.println("[NVS] ERROR: failed to clear pending command");
+    return false;
+  }
+
+  Serial.printf("[NVS] Pending command cleared: %s\r\n", expectedId.c_str());
+  return true;
+}
+
+String getPendingId() {
+  return nvs.getString("pending_id", "");
 }
 
 void saveWiFiInfo() {
@@ -101,7 +270,8 @@ void saveWiFiInfo() {
 // ===================== Message Parsing ========================
 
 bool extractJsonString(const char* json, const char* key, char* value, int maxLen) {
-  // Extracts value from JSON like: {"key": "value"}
+  // Extracts value from JSON like: {"key":"value"}.
+  // This is intentionally simple because the command schema is fixed and tiny.
   String keyPattern = "\"" + String(key) + "\":\"";
   String jsonStr(json);
 
@@ -128,7 +298,10 @@ Message parseMessage(const byte* payload, unsigned int length) {
   }
 
   char* buffer = (char*)malloc(length + 1);
-  if (!buffer) return msg;
+  if (!buffer) {
+    Serial.println("[MSG] ERROR: out of memory while parsing payload");
+    return msg;
+  }
 
   memcpy(buffer, payload, length);
   buffer[length] = '\0';
@@ -152,6 +325,35 @@ void pulseRelay() {
   Serial.println("[GPIO] Relay deactivated");
 }
 
+// ===================== Time / TLS =============================
+
+bool syncSystemTime() {
+  time_t now = time(nullptr);
+
+  // Deep sleep preserves the ESP32 RTC/system clock. Only sync if the clock is
+  // obviously invalid (e.g. after a cold boot without a previous time source).
+  if (now >= MIN_VALID_EPOCH) {
+    Serial.printf("[TIME] System clock already valid: %ld\r\n", (long)now);
+    return true;
+  }
+
+  Serial.println("[TIME] Synchronizing system clock with NTP...");
+  configTime(0, 0, NTP_SERVER);
+
+  unsigned long start = millis();
+  while (millis() - start < TIME_SYNC_TIMEOUT_MS) {
+    now = time(nullptr);
+    if (now >= MIN_VALID_EPOCH) {
+      Serial.printf("[TIME] NTP synchronized: %ld\r\n", (long)now);
+      return true;
+    }
+    delay(100);
+  }
+
+  Serial.println("[TIME] ERROR: NTP synchronization timed out");
+  return false;
+}
+
 // ===================== MQTT ===================================
 
 const char* getMqttStateString(int state) {
@@ -170,10 +372,74 @@ const char* getMqttStateString(int state) {
   }
 }
 
+void onMqttMessage(char* topic, byte* payload, unsigned int length);
+
+void sendTelegramNotification(const String& id, const String& result) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Telegram] WiFi not connected, cannot send notification");
+    return;
+  }
+
+  String message;
+  if (result == "OK") {
+    message = "🚪 OpenGate: gate opened\nCommand ID: " + id;
+  } else if (result == "DUPLICATE") {
+    message = "⚠️ OpenGate: duplicate command ignored\nCommand ID: " + id;
+  } else if (result == "RECOVERED") {
+    message = "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again\nCommand ID: " + id;
+  } else if (result == "NVS_ERROR") {
+    message = "❌ OpenGate: NVS error, gate command NOT executed\nCommand ID: " + id;
+  } else {
+    message = "⚠️ OpenGate: command result = " + result + "\nCommand ID: " + id;
+  }
+
+  bool sent = telegramBot.sendMessage(TELEGRAM_CHAT_ID, message, "");
+  if (sent) {
+    Serial.println("[Telegram] Notification sent");
+  } else {
+    Serial.println("[Telegram] Failed to send notification");
+  }
+}
+
+bool publishAck(const String& id, const String& result) {
+  bool mqttOk = false;
+
+  if (!mqtt.connected()) {
+    Serial.println("[ACK] MQTT not connected, cannot publish");
+  } else {
+    time_t now = time(nullptr);
+    struct tm* timeinfo = gmtime(&now);
+    char timestamp[30];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"id\":\"%s\",\"result\":\"%s\",\"timestamp\":\"%s\"}",
+             id.c_str(), result.c_str(), timestamp);
+
+    // PubSubClient publish(topic, payload, length, retain): the library does
+    // not provide QoS 1 publishing through this overload. For this ACK we keep
+    // retain=false. The command itself is what uses QoS 1/persistent delivery.
+    //
+    // IMPORTANT: do not claim this ACK is QoS 1 if PubSubClient is configured
+    // only for QoS 0 publishing.
+    mqttOk = mqtt.publish(MQTT_ACK_TOPIC, payload, false);
+
+    if (mqttOk) {
+      Serial.printf("[ACK] Published (QoS 0, retain=false): %s\r\n", payload);
+    } else {
+      Serial.println("[ACK] Failed to publish");
+    }
+  }
+
+  // Telegram is attempted independently from the MQTT ACK.
+  sendTelegramNotification(id, result);
+  return mqttOk;
+}
+
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
 
-  // Log raw payload
   char rawPayload[512];
   if (length >= sizeof(rawPayload)) {
     Serial.println("[MQTT] Payload too large to log");
@@ -194,20 +460,52 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   Serial.printf("[MSG] id=%s, command=%s\r\n", msg.id, msg.command);
 
-  // Deduplication check
+  // Deduplication check.
   if (hasProcessedId(id)) {
     Serial.printf("[CMD] DUPLICATE id=%s\r\n", msg.id);
     publishAck(id, "DUPLICATE");
-  } else if (command == "OPEN") {
-    Serial.println("[CMD] Executing OPEN");
-    pulseRelay();
-    saveProcessedId(id);
-    publishAck(id, "OK");
-  } else {
-    Serial.printf("[CMD] Unknown command: %s\r\n", msg.command);
-    publishAck(id, "UNKNOWN_COMMAND");
+    messageProcessed = true;
+    return;
   }
 
+  if (command != "OPEN") {
+    Serial.printf("[CMD] Unknown command: %s\r\n", msg.command);
+    publishAck(id, "UNKNOWN_COMMAND");
+    messageProcessed = true;
+    return;
+  }
+
+  // -----------------------------------------------------------------
+  // Transactional hardware execution:
+  // reserve the command in NVS BEFORE activating the relay.
+  // -----------------------------------------------------------------
+  if (!reservePendingId(id)) {
+    Serial.printf("[CMD] Refusing OPEN because PENDING reservation failed: %s\r\n", id.c_str());
+    publishAck(id, "NVS_ERROR");
+    messageProcessed = true;
+    return;
+  }
+
+  Serial.printf("[CMD] Executing OPEN id=%s\r\n", id.c_str());
+  pulseRelay();
+
+  // Persist completion before acknowledging success.
+  if (!saveProcessedId(id)) {
+    // Keep pending_id in NVS. On the next boot the command will be treated as
+    // already-triggered and will NOT activate the relay again.
+    Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
+    publishAck(id, "EXECUTED_NVS_ERROR");
+    messageProcessed = true;
+    return;
+  }
+
+  // Once processed-ID is durable, the pending reservation can be removed.
+  if (!clearPendingId(id)) {
+    // processed-ID already protects against a second execution, so this is safe.
+    Serial.println("[CMD] WARNING: processed ID saved but PENDING flag could not be cleared");
+  }
+
+  publishAck(id, "OK");
   messageProcessed = true;
 }
 
@@ -234,7 +532,7 @@ void connectWiFi() {
     }
   }
 
-  unsigned long timeout = millis() + 10000;  // 10 second timeout
+  unsigned long timeout = millis() + 10000;
   while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
     delay(500);
     Serial.print(".");
@@ -248,6 +546,28 @@ void connectWiFi() {
   }
 }
 
+void setupTls() {
+  // MQTT TLS: full certificate verification using the CA configured in secrets.h.
+  if (strstr(ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
+    tlsClient.setCACert(ROOT_CA);
+  } else {
+    Serial.println("[TLS/MQTT] ERROR: ROOT_CA is missing");
+    tlsClient.setInsecure();
+  }
+  tlsClient.setTimeout(5000);
+
+  // Telegram TLS: certificate verification using the GoDaddy Root G2 CA.
+  // api.telegram.org is currently served with a GoDaddy-issued certificate,
+  // and GoDaddy publishes this root certificate in its official repository.
+  if (strstr(TELEGRAM_ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
+    telegramClient.setCACert(TELEGRAM_ROOT_CA);
+    Serial.println("[TLS/Telegram] Certificate verification enabled");
+  } else {
+    Serial.println("[TLS/Telegram] ERROR: TELEGRAM_ROOT_CA is missing");
+  }
+  telegramClient.setTimeout(5000);
+}
+
 void connectMqtt() {
   int attempts = 0;
   const int MAX_ATTEMPTS = 3;
@@ -255,10 +575,13 @@ void connectMqtt() {
   while (!mqtt.connected() && attempts < MAX_ATTEMPTS) {
     Serial.printf("[MQTT] Connecting (attempt %d/%d)...\r\n", attempts + 1, MAX_ATTEMPTS);
 
-    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-      Serial.println("[MQTT] Connected to broker");
+    // MQTT 3.1.1 persistent session: cleanSession=false.
+    // This preserves the subscription and queued QoS 1 messages while the
+    // ESP32 is disconnected/deep sleeping.
+    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD,
+                     nullptr, 0, false, nullptr, false)) {
+      Serial.println("[MQTT] Connected to broker (persistent session)");
 
-      // Subscribe with QoS 1
       if (mqtt.subscribe(MQTT_CMD_TOPIC, 1)) {
         Serial.printf("[MQTT] Successfully subscribed to %s (QoS 1)\r\n", MQTT_CMD_TOPIC);
       } else {
@@ -281,28 +604,46 @@ void connectMqtt() {
   }
 }
 
-void publishAck(const String& id, const String& result) {
-  if (!mqtt.connected()) {
-    Serial.println("[ACK] MQTT not connected, cannot publish");
+// ===================== Pending recovery =======================
+
+void recoverPendingCommand() {
+  String pendingId = getPendingId();
+  if (pendingId.isEmpty()) {
     return;
   }
 
-  // Build ISO 8601 timestamp
-  time_t now = time(nullptr);
-  struct tm* timeinfo = gmtime(&now);
-  char timestamp[30];
-  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+  Serial.printf("[RECOVERY] Found pending command after reset: %s\r\n", pendingId.c_str());
 
-  // Build JSON manually
-  char payload[256];
-  snprintf(payload, sizeof(payload),
-           "{\"id\":\"%s\",\"result\":\"%s\",\"timestamp\":\"%s\"}",
-           id.c_str(), result.c_str(), timestamp);
+  // If it is already in processed_ids, the previous boot completed the hardware
+  // action and persisted completion; only the final cleanup may have been interrupted.
+  if (hasProcessedId(pendingId)) {
+    Serial.println("[RECOVERY] Command already committed as PROCESSED; clearing stale PENDING flag");
+    clearPendingId(pendingId);
+    return;
+  }
 
-  if (mqtt.publish(MQTT_ACK_TOPIC, payload, 1)) {  // QoS 1
-    Serial.printf("[ACK] Published: %s\r\n", payload);
+  // We cannot know whether the relay pulse completed before the reset. To prevent
+  // a second gate opening, never execute the relay again. Instead report the state.
+  Serial.println("[RECOVERY] Command execution state is uncertain; relay will NOT be triggered again");
+
+  // Try MQTT ACK first. If MQTT is unavailable, leave PENDING in NVS and retry recovery
+  // after the next boot.
+  if (!mqtt.connected()) {
+    Serial.println("[RECOVERY] MQTT not connected; keeping PENDING command");
+    return;
+  }
+
+  bool ackOk = publishAck(pendingId, "RECOVERED");
+  if (!ackOk) {
+    Serial.println("[RECOVERY] MQTT ACK failed; keeping PENDING command for next boot");
+    return;
+  }
+
+  if (saveProcessedId(pendingId)) {
+    clearPendingId(pendingId);
+    Serial.println("[RECOVERY] Pending command marked PROCESSED without re-triggering relay");
   } else {
-    Serial.println("[ACK] Failed to publish");
+    Serial.println("[RECOVERY] WARNING: ACK sent but processed-ID could not be saved; keeping PENDING flag");
   }
 }
 
@@ -317,36 +658,40 @@ void setup() {
 
   Serial.println("\r\n================== ESP32 WAKE UP ==================");
 
-  // Initialize NVS
-  nvsInit();
+  if (!nvsInit()) {
+    Serial.println("[Init] NVS initialization failed; entering deep sleep");
+    esp_deep_sleep(DEEP_SLEEP_DURATION_US);
+  }
 
-  // Generate stable client ID from MAC
+  // Generate stable client ID from MAC.
   clientId = "opengate-esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   Serial.printf("[Init] Client ID: %s\r\n", clientId.c_str());
 
-  // Connect to WiFi
   connectWiFi();
 
-  // Setup MQTT
-  if (strstr(ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
-    tlsClient.setCACert(ROOT_CA);
-  } else {
-    Serial.println("[TLS] No root CA configured, using setInsecure()");
-    tlsClient.setInsecure();
+  if (WiFi.status() == WL_CONNECTED) {
+    bool timeValid = syncSystemTime();
+    if (!timeValid) {
+      Serial.println("[Init] WARNING: system time is not valid; certificate verification may fail");
+    }
   }
+
+  setupTls();
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
   mqtt.setKeepAlive(30);
 
-  // Connect to MQTT
   connectMqtt();
 
-  // Verify MQTT connection before waiting for messages
   if (!mqtt.connected()) {
     Serial.println("[MQTT] ERROR: Not connected to MQTT broker, skipping wait");
   } else {
-    // Wait for message with timeout
+    // Recover a hardware transaction interrupted by a reset before listening for
+    // new messages, so the pending command cannot be executed a second time.
+    recoverPendingCommand();
+
+    // Wait for a new command with timeout.
     messageProcessed = false;
     unsigned long startTime = millis();
     unsigned long loopCount = 0;
@@ -373,24 +718,20 @@ void setup() {
       Serial.println("[MSG] No command received");
     }
 
-    // Disconnect MQTT gracefully
     if (mqtt.connected()) {
       mqtt.disconnect();
       Serial.println("[MQTT] Disconnected");
     }
   }
 
-  // Close NVS
   nvs.end();
 
-  // Enter deep sleep
   Serial.printf("\r\n[Sleep] Going to deep sleep for 2 minutes...\r\n");
   Serial.flush();
 
   esp_deep_sleep(DEEP_SLEEP_DURATION_US);
-  // Never reached
 }
 
 void loop() {
-  // Never reached due to deep sleep
+  // Never reached due to deep sleep.
 }
