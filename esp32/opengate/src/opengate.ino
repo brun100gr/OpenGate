@@ -24,6 +24,18 @@
  * This design therefore prefers preventing a possible second gate opening over
  * guaranteeing that every command is eventually executed.
  *
+ * IMPORTANT (PUBACK timing):
+ * PubSubClient sends the QoS 1 PUBACK only AFTER the message callback returns.
+ * The callback therefore does nothing but parse the command and store it; the
+ * relay pulse, the MQTT ACK and the Telegram notification all run afterwards,
+ * from setup(). Doing that slow work inside the callback would hold back the
+ * PUBACK, and if the MQTT socket died in the meantime the broker would never
+ * receive it and would re-deliver the same command on every reconnection.
+ *
+ * The Telegram notification is also deferred until after the MQTT connection is
+ * closed: two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is
+ * enough to make the handshake fail on an ESP32.
+ *
  * Credentials and certificates live in secrets.h (gitignored): copy
  * secrets.h.example to secrets.h and fill in your values.
  *
@@ -143,13 +155,29 @@ UniversalTelegramBot telegramBot(TELEGRAM_BOT_TOKEN, telegramClient);
 
 Preferences nvs;
 String clientId;
-volatile bool messageProcessed = false;
 
 struct Message {
   char id[64];
   char command[32];
   bool valid;
 };
+
+// Command parsed by the MQTT callback and executed later, outside of it.
+Message receivedCommand = {"", "", false};
+volatile bool commandReceived = false;
+
+// Telegram notifications are queued and only delivered once the MQTT connection
+// has been closed, so the two TLS sessions never compete for heap.
+// Two slots are enough: at most one recovery notification plus one command.
+const int MAX_QUEUED_NOTIFICATIONS = 2;
+
+struct Notification {
+  String id;
+  String result;
+};
+
+Notification notificationQueue[MAX_QUEUED_NOTIFICATIONS];
+int notificationCount = 0;
 
 // ============================= NVS ==============================
 
@@ -401,6 +429,27 @@ void sendTelegramNotification(const String& id, const String& result) {
   }
 }
 
+void queueNotification(const String& id, const String& result) {
+  if (notificationCount >= MAX_QUEUED_NOTIFICATIONS) {
+    Serial.printf("[Telegram] Queue full, dropping notification for %s\r\n", id.c_str());
+    return;
+  }
+
+  notificationQueue[notificationCount].id = id;
+  notificationQueue[notificationCount].result = result;
+  notificationCount++;
+}
+
+// Sends every queued notification. Call this only after mqtt.disconnect(), so
+// that the MQTT mbedTLS context has been freed and the Telegram handshake has
+// the whole heap available.
+void flushNotifications() {
+  for (int i = 0; i < notificationCount; i++) {
+    sendTelegramNotification(notificationQueue[i].id, notificationQueue[i].result);
+  }
+  notificationCount = 0;
+}
+
 bool publishAck(const String& id, const String& result) {
   bool mqttOk = false;
 
@@ -432,11 +481,18 @@ bool publishAck(const String& id, const String& result) {
     }
   }
 
-  // Telegram is attempted independently from the MQTT ACK.
-  sendTelegramNotification(id, result);
+  // Telegram is independent from the MQTT ACK, and is deferred until the MQTT
+  // connection has been closed.
+  queueNotification(id, result);
   return mqttOk;
 }
 
+// MQTT message callback.
+//
+// Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
+// only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). The
+// command is therefore only parsed and stored here; processReceivedCommand()
+// does the actual work once we are back in setup().
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
 
@@ -449,29 +505,43 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] Raw payload: %s\r\n", rawPayload);
   }
 
+  // Defensive: the wait loop stops calling mqtt.loop() as soon as a command is
+  // stored, so this should never happen. Dropping the message here would still
+  // PUBACK it and lose it, hence the warning.
+  if (commandReceived) {
+    Serial.println("[MQTT] WARNING: a command is already queued for this wake; message dropped");
+    return;
+  }
+
   Message msg = parseMessage(payload, length);
   if (!msg.valid) {
     Serial.println("[MSG] Missing id or command field");
     return;
   }
 
-  String id(msg.id);
-  String command(msg.command);
+  receivedCommand = msg;
+  commandReceived = true;
+}
 
-  Serial.printf("[MSG] id=%s, command=%s\r\n", msg.id, msg.command);
+// Executes the command stored by onMqttMessage(). Must run outside the MQTT
+// callback, so that the PUBACK for this command has already left the device
+// before the slow work (relay pulse, ACK, notification) starts.
+void processReceivedCommand() {
+  String id(receivedCommand.id);
+  String command(receivedCommand.command);
+
+  Serial.printf("[MSG] id=%s, command=%s\r\n", receivedCommand.id, receivedCommand.command);
 
   // Deduplication check.
   if (hasProcessedId(id)) {
-    Serial.printf("[CMD] DUPLICATE id=%s\r\n", msg.id);
+    Serial.printf("[CMD] DUPLICATE id=%s\r\n", id.c_str());
     publishAck(id, "DUPLICATE");
-    messageProcessed = true;
     return;
   }
 
   if (command != "OPEN") {
-    Serial.printf("[CMD] Unknown command: %s\r\n", msg.command);
+    Serial.printf("[CMD] Unknown command: %s\r\n", command.c_str());
     publishAck(id, "UNKNOWN_COMMAND");
-    messageProcessed = true;
     return;
   }
 
@@ -482,7 +552,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (!reservePendingId(id)) {
     Serial.printf("[CMD] Refusing OPEN because PENDING reservation failed: %s\r\n", id.c_str());
     publishAck(id, "NVS_ERROR");
-    messageProcessed = true;
     return;
   }
 
@@ -495,7 +564,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     // already-triggered and will NOT activate the relay again.
     Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
     publishAck(id, "EXECUTED_NVS_ERROR");
-    messageProcessed = true;
     return;
   }
 
@@ -506,7 +574,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   publishAck(id, "OK");
-  messageProcessed = true;
 }
 
 void connectWiFi() {
@@ -582,6 +649,8 @@ void connectMqtt() {
                      nullptr, 0, false, nullptr, false)) {
       Serial.println("[MQTT] Connected to broker (persistent session)");
 
+      // Re-subscribing on an existing persistent session is redundant but
+      // harmless, and it is required after the broker expires the session.
       if (mqtt.subscribe(MQTT_CMD_TOPIC, 1)) {
         Serial.printf("[MQTT] Successfully subscribed to %s (QoS 1)\r\n", MQTT_CMD_TOPIC);
       } else {
@@ -692,29 +761,37 @@ void setup() {
     recoverPendingCommand();
 
     // Wait for a new command with timeout.
-    messageProcessed = false;
+    commandReceived = false;
     unsigned long startTime = millis();
     unsigned long loopCount = 0;
 
     Serial.printf("[MQTT] Waiting for command (timeout=%lu ms)\r\n", MQTT_AWAKE_TIMEOUT_MS);
 
     while (millis() - startTime < MQTT_AWAKE_TIMEOUT_MS) {
-      if (mqtt.connected()) {
-        mqtt.loop();
-        loopCount++;
-        if (messageProcessed) {
-          break;
-        }
-      } else {
+      if (!mqtt.connected()) {
         Serial.println("[MQTT] Connection lost during wait");
         break;
       }
+
+      mqtt.loop();
+      loopCount++;
+
+      // mqtt.loop() has already written the PUBACK for this command.
+      if (commandReceived) {
+        break;
+      }
+
       delay(50);
     }
 
     Serial.printf("[MQTT] Wait ended after %lu ms (%lu loops)\r\n", millis() - startTime, loopCount);
 
-    if (!messageProcessed) {
+    // From here on mqtt.loop() is deliberately NOT called again: it would read
+    // the next queued command out of the socket and PUBACK it without executing
+    // it. Leaving it unread keeps it queued on the broker for the next wake.
+    if (commandReceived) {
+      processReceivedCommand();
+    } else {
       Serial.println("[MSG] No command received");
     }
 
@@ -723,6 +800,10 @@ void setup() {
       Serial.println("[MQTT] Disconnected");
     }
   }
+
+  // Only now, with the MQTT TLS context freed by disconnect(), is there enough
+  // heap for the handshake to api.telegram.org.
+  flushNotifications();
 
   nvs.end();
 
