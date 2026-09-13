@@ -36,6 +36,13 @@
  * closed: two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is
  * enough to make the handshake fail on an ESP32.
  *
+ * Only ONE hardware action is performed per wake. Once a command has run, the
+ * broker queue is drained before deep sleep: every further command is
+ * acknowledged (so the broker stops re-delivering it) and discarded.
+ *
+ * New command types are added to COMMAND_TABLE; see the "Command dispatch"
+ * section.
+ *
  * Credentials and certificates live in secrets.h (gitignored): copy
  * secrets.h.example to secrets.h and fill in your values.
  *
@@ -74,6 +81,13 @@ const uint64_t DEEP_SLEEP_DURATION_US = 2ULL * 60 * 1000000;
 
 // MQTT awake timeout: wait this long for a message during wake
 const unsigned long MQTT_AWAKE_TIMEOUT_MS = 10000;
+
+// After a command has been executed, the broker queue is drained so that no
+// command is left unacknowledged before deep sleep. Draining stops once the
+// socket has been silent for MQTT_DRAIN_GRACE_MS, and never lasts longer than
+// MQTT_DRAIN_MAX_MS.
+const unsigned long MQTT_DRAIN_GRACE_MS = 500;
+const unsigned long MQTT_DRAIN_MAX_MS = 5000;
 
 // Maximum number of processed command IDs to store
 const int MAX_PROCESSED_IDS = 20;
@@ -171,21 +185,27 @@ struct Message {
   bool valid;
 };
 
+// A command handler performs the hardware action for one command type and
+// returns true on success. See the "Command dispatch" section for the table
+// that binds handlers to command names.
+typedef bool (*CommandHandler)();
+
+struct CommandDefinition {
+  const char* name;
+  CommandHandler handler;
+  bool requiresReservation;
+};
+
 // Command parsed by the MQTT callback and executed later, outside of it.
 Message receivedCommand = {"", "", false};
 volatile bool commandReceived = false;
 
 // Telegram notifications are queued and only delivered once the MQTT connection
 // has been closed, so the two TLS sessions never compete for heap.
-// Two slots are enough: at most one recovery notification plus one command.
-const int MAX_QUEUED_NOTIFICATIONS = 2;
+// Worst case per wake: one recovery + one executed command + one drain summary.
+const int MAX_QUEUED_NOTIFICATIONS = 4;
 
-struct Notification {
-  String id;
-  String result;
-};
-
-Notification notificationQueue[MAX_QUEUED_NOTIFICATIONS];
+String notificationQueue[MAX_QUEUED_NOTIFICATIONS];
 int notificationCount = 0;
 
 // ============================= NVS ==============================
@@ -429,55 +449,69 @@ const char* getMqttStateString(int state) {
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length);
 
-void sendTelegramNotification(const String& id, const String& result) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[Telegram] WiFi not connected, cannot send notification");
+String formatNotification(const String& id, const String& result) {
+  if (result == "OK") {
+    return "🚪 OpenGate: gate opened\nCommand ID: " + id;
+  }
+  if (result == "DUPLICATE") {
+    return "⚠️ OpenGate: duplicate command ignored\nCommand ID: " + id;
+  }
+  if (result == "RECOVERED") {
+    return "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again\nCommand ID: " + id;
+  }
+  if (result == "NVS_ERROR") {
+    return "❌ OpenGate: NVS error, gate command NOT executed\nCommand ID: " + id;
+  }
+  if (result == "UNKNOWN_COMMAND") {
+    return "⚠️ OpenGate: unsupported command received\nCommand ID: " + id;
+  }
+  return "⚠️ OpenGate: command result = " + result + "\nCommand ID: " + id;
+}
+
+void queueMessage(const String& message) {
+  if (notificationCount >= MAX_QUEUED_NOTIFICATIONS) {
+    Serial.println("[Telegram] Queue full, dropping notification");
     return;
   }
 
-  String message;
-  if (result == "OK") {
-    message = "🚪 OpenGate: gate opened\nCommand ID: " + id;
-  } else if (result == "DUPLICATE") {
-    message = "⚠️ OpenGate: duplicate command ignored\nCommand ID: " + id;
-  } else if (result == "RECOVERED") {
-    message = "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again\nCommand ID: " + id;
-  } else if (result == "NVS_ERROR") {
-    message = "❌ OpenGate: NVS error, gate command NOT executed\nCommand ID: " + id;
-  } else {
-    message = "⚠️ OpenGate: command result = " + result + "\nCommand ID: " + id;
-  }
-
-  bool sent = telegramBot.sendMessage(TELEGRAM_CHAT_ID, message, "");
-  if (sent) {
-    Serial.println("[Telegram] Notification sent");
-  } else {
-    Serial.println("[Telegram] Failed to send notification");
-  }
+  notificationQueue[notificationCount] = message;
+  notificationCount++;
 }
 
 void queueNotification(const String& id, const String& result) {
-  if (notificationCount >= MAX_QUEUED_NOTIFICATIONS) {
-    Serial.printf("[Telegram] Queue full, dropping notification for %s\r\n", id.c_str());
-    return;
-  }
-
-  notificationQueue[notificationCount].id = id;
-  notificationQueue[notificationCount].result = result;
-  notificationCount++;
+  queueMessage(formatNotification(id, result));
 }
 
 // Sends every queued notification. Call this only after mqtt.disconnect(), so
 // that the MQTT mbedTLS context has been freed and the Telegram handshake has
 // the whole heap available.
 void flushNotifications() {
-  for (int i = 0; i < notificationCount; i++) {
-    sendTelegramNotification(notificationQueue[i].id, notificationQueue[i].result);
+  if (notificationCount == 0) {
+    return;
   }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[Telegram] WiFi not connected, dropping %d notification(s)\r\n", notificationCount);
+    notificationCount = 0;
+    return;
+  }
+
+  for (int i = 0; i < notificationCount; i++) {
+    bool sent = telegramBot.sendMessage(TELEGRAM_CHAT_ID, notificationQueue[i], "");
+    if (sent) {
+      Serial.println("[Telegram] Notification sent");
+    } else {
+      Serial.println("[Telegram] Failed to send notification");
+    }
+  }
+
   notificationCount = 0;
 }
 
-bool publishAck(const String& id, const String& result) {
+// Publishes the MQTT ACK for a command. Set notify=false for results that must
+// not reach Telegram individually (for example each drained command, which is
+// summarised in a single message instead).
+bool publishAck(const String& id, const String& result, bool notify = true) {
   bool mqttOk = false;
 
   if (!mqtt.connected()) {
@@ -510,7 +544,9 @@ bool publishAck(const String& id, const String& result) {
 
   // Telegram is independent from the MQTT ACK, and is deferred until the MQTT
   // connection has been closed.
-  queueNotification(id, result);
+  if (notify) {
+    queueNotification(id, result);
+  }
   return mqttOk;
 }
 
@@ -550,9 +586,42 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   commandReceived = true;
 }
 
+// ===================== Command dispatch =======================
+//
+// To add a new command, write a handler returning true on success and append an
+// entry to COMMAND_TABLE. Nothing else needs to change: parsing, deduplication,
+// ACK, Telegram notification and queue draining are already generic.
+//
+// requiresReservation marks commands with an irreversible physical effect. Those
+// go through the NVS PENDING reservation, which guarantees at-most-once
+// execution across a reset (see the file header). Read-only or idempotent
+// commands should set it to false: they are cheap to repeat and skip the two
+// extra flash writes.
+
+bool handleOpen() {
+  pulseRelay();
+  oscillateServo();
+  return true;
+}
+
+const CommandDefinition COMMAND_TABLE[] = {
+  {"OPEN", handleOpen, true},
+};
+
+const int COMMAND_COUNT = sizeof(COMMAND_TABLE) / sizeof(COMMAND_TABLE[0]);
+
+const CommandDefinition* findCommand(const String& name) {
+  for (int i = 0; i < COMMAND_COUNT; i++) {
+    if (name == COMMAND_TABLE[i].name) {
+      return &COMMAND_TABLE[i];
+    }
+  }
+  return nullptr;
+}
+
 // Executes the command stored by onMqttMessage(). Must run outside the MQTT
 // callback, so that the PUBACK for this command has already left the device
-// before the slow work (relay pulse, ACK, notification) starts.
+// before the slow work (hardware action, ACK, notification) starts.
 void processReceivedCommand() {
   String id(receivedCommand.id);
   String command(receivedCommand.command);
@@ -566,30 +635,47 @@ void processReceivedCommand() {
     return;
   }
 
-  if (command != "OPEN") {
-    Serial.printf("[CMD] Unknown command: %s\r\n", command.c_str());
+  const CommandDefinition* definition = findCommand(command);
+  if (definition == nullptr) {
+    Serial.printf("[CMD] Unsupported command: %s\r\n", command.c_str());
     publishAck(id, "UNKNOWN_COMMAND");
+    return;
+  }
+
+  // Commands with no irreversible effect run directly: re-executing them after
+  // a reset is harmless, so they need no PENDING reservation.
+  if (!definition->requiresReservation) {
+    Serial.printf("[CMD] Executing %s id=%s\r\n", command.c_str(), id.c_str());
+    bool ok = definition->handler();
+
+    if (!saveProcessedId(id)) {
+      Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
+    }
+
+    publishAck(id, ok ? "OK" : "FAILED");
     return;
   }
 
   // -----------------------------------------------------------------
   // Transactional hardware execution:
-  // reserve the command in NVS BEFORE activating the relay.
+  // reserve the command in NVS BEFORE running the handler.
   // -----------------------------------------------------------------
   if (!reservePendingId(id)) {
-    Serial.printf("[CMD] Refusing OPEN because PENDING reservation failed: %s\r\n", id.c_str());
+    Serial.printf("[CMD] Refusing %s because PENDING reservation failed: %s\r\n",
+                  command.c_str(), id.c_str());
     publishAck(id, "NVS_ERROR");
     return;
   }
 
-  Serial.printf("[CMD] Executing OPEN id=%s\r\n", id.c_str());
-  pulseRelay();
-  oscillateServo();
+  Serial.printf("[CMD] Executing %s id=%s\r\n", command.c_str(), id.c_str());
+  bool ok = definition->handler();
 
-  // Persist completion before acknowledging success.
+  // Persist completion before acknowledging. This runs even when the handler
+  // reported a failure: the hardware may have moved anyway, and at-most-once
+  // forbids a second attempt.
   if (!saveProcessedId(id)) {
     // Keep pending_id in NVS. On the next boot the command will be treated as
-    // already-triggered and will NOT activate the relay again.
+    // already-triggered and the handler will NOT run again.
     Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
     publishAck(id, "EXECUTED_NVS_ERROR");
     return;
@@ -601,7 +687,79 @@ void processReceivedCommand() {
     Serial.println("[CMD] WARNING: processed ID saved but PENDING flag could not be cleared");
   }
 
-  publishAck(id, "OK");
+  publishAck(id, ok ? "OK" : "FAILED");
+}
+
+// Acknowledges and throws away a command that arrived after the one already
+// executed during this wake.
+void discardQueuedCommand() {
+  String id(receivedCommand.id);
+
+  Serial.printf("[CMD] Discarding queued command id=%s command=%s\r\n",
+                receivedCommand.id, receivedCommand.command);
+
+  // Store the ID even though nothing was executed: if the PUBACK were lost, the
+  // broker would re-deliver this command on a later wake, where it would be
+  // executed for real. The processed-ID list is what blocks that.
+  if (!saveProcessedId(id)) {
+    Serial.println("[CMD] WARNING: discarded command could not be added to the processed-ID list");
+  }
+
+  // MQTT ACK only: the publisher still learns the outcome, but each discarded
+  // command does not become its own Telegram message.
+  publishAck(id, "DISCARDED", false);
+}
+
+// Drains the commands the broker still has queued for us, so that none is left
+// unacknowledged when the ESP32 goes back to deep sleep. Every message read here
+// is PUBACKed by PubSubClient and then discarded: only one hardware action is
+// allowed per wake.
+void drainQueuedCommands() {
+  Serial.println("[MQTT] Draining queued commands before sleep");
+
+  unsigned long drainStart = millis();
+  unsigned long lastActivity = millis();
+  int discarded = 0;
+
+  while (millis() - drainStart < MQTT_DRAIN_MAX_MS) {
+    if (!mqtt.connected()) {
+      Serial.println("[MQTT] Connection lost while draining");
+      break;
+    }
+
+    commandReceived = false;
+    mqtt.loop();
+
+    if (commandReceived) {
+      discardQueuedCommand();
+      discarded++;
+      lastActivity = millis();
+      continue;
+    }
+
+    // Bytes already decrypted and waiting: another packet is on its way, so keep
+    // reading without burning the grace period.
+    if (tlsClient.available() > 0) {
+      lastActivity = millis();
+      continue;
+    }
+
+    if (millis() - lastActivity >= MQTT_DRAIN_GRACE_MS) {
+      break;
+    }
+
+    delay(20);
+  }
+
+  commandReceived = false;
+
+  if (discarded > 0) {
+    Serial.printf("[MQTT] Drain complete, %d queued command(s) discarded\r\n", discarded);
+    queueMessage("⚠️ OpenGate: " + String(discarded) +
+                 " further queued command(s) acknowledged and discarded");
+  } else {
+    Serial.println("[MQTT] Drain complete, no queued commands left");
+  }
 }
 
 void connectWiFi() {
@@ -817,12 +975,16 @@ void setup() {
 
     Serial.printf("[MQTT] Wait ended after %lu ms (%lu loops)\r\n", millis() - startTime, loopCount);
 
-    // From here on mqtt.loop() is deliberately NOT called again: it would read
-    // the next queued command out of the socket and PUBACK it without executing
-    // it. Leaving it unread keeps it queued on the broker for the next wake.
+    // From here on the only caller of mqtt.loop() is drainQueuedCommands(),
+    // which acknowledges and discards whatever else the broker has queued. That
+    // guarantees nothing is left unacknowledged when we go back to sleep, while
+    // still allowing only one hardware action per wake.
     if (commandReceived) {
       processReceivedCommand();
+      drainQueuedCommands();
     } else {
+      // The wait loop already polled the broker for MQTT_AWAKE_TIMEOUT_MS
+      // without receiving anything, so there is nothing queued to drain.
       Serial.println("[MSG] No command received");
     }
 
