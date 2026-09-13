@@ -50,6 +50,7 @@
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <UniversalTelegramBot.h>
+#include <ESP32Servo.h>
 #include <time.h>
 
 #include "secrets.h"
@@ -61,6 +62,12 @@ const char* MQTT_ACK_TOPIC = "opengate/ack";
 
 const int RELAY_PIN = 26;
 const unsigned long PULSE_MS = 1000;
+
+const int SERVO_PIN = 25;
+const int SERVO_ANGLE = 90;
+const unsigned long SERVO_MOVE_DELAY_MS = 2000;
+const unsigned long SERVO_RETURN_DELAY_MS = 1000;
+const int SERVO_CYCLES = 3;
 
 // Deep sleep duration: 2 minutes in microseconds
 const uint64_t DEEP_SLEEP_DURATION_US = 2ULL * 60 * 1000000;
@@ -152,6 +159,8 @@ PubSubClient mqtt(tlsClient);
 
 WiFiClientSecure telegramClient;
 UniversalTelegramBot telegramBot(TELEGRAM_BOT_TOKEN, telegramClient);
+
+Servo servo;
 
 Preferences nvs;
 String clientId;
@@ -351,6 +360,24 @@ void pulseRelay() {
   delay(PULSE_MS);
   digitalWrite(RELAY_PIN, LOW);
   Serial.println("[GPIO] Relay deactivated");
+}
+
+void oscillateServo() {
+  Serial.println("[GPIO] Starting servo oscillation");
+
+  for (int cycle = 0; cycle < SERVO_CYCLES; cycle++) {
+    Serial.printf("[GPIO] Servo cycle %d/%d\r\n", cycle + 1, SERVO_CYCLES);
+
+    servo.write(SERVO_ANGLE);
+    Serial.printf("[GPIO] Servo moved to %d degrees\r\n", SERVO_ANGLE);
+    delay(SERVO_MOVE_DELAY_MS);
+
+    servo.write(0);
+    Serial.println("[GPIO] Servo returned to 0 degrees");
+    delay(SERVO_RETURN_DELAY_MS);
+  }
+
+  Serial.println("[GPIO] Servo oscillation complete");
 }
 
 // ===================== Time / TLS =============================
@@ -557,6 +584,7 @@ void processReceivedCommand() {
 
   Serial.printf("[CMD] Executing OPEN id=%s\r\n", id.c_str());
   pulseRelay();
+  oscillateServo();
 
   // Persist completion before acknowledging success.
   if (!saveProcessedId(id)) {
@@ -721,6 +749,9 @@ void recoverPendingCommand() {
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+
+  servo.attach(SERVO_PIN);
+  servo.write(0);
 
   Serial.begin(115200);
   delay(100);
