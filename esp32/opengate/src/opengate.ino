@@ -24,21 +24,36 @@
  * This design therefore prefers preventing a possible second gate opening over
  * guaranteeing that every command is eventually executed.
  *
+ * IMPORTANT (wake flow):
+ * Each wake is split into two distinct phases:
+ *
+ *   1. COLLECT — every command the broker has queued is read and PUBACKed, so
+ *      none of them is delivered again at the next wake. Nothing is executed
+ *      and no hardware moves during this phase.
+ *   2. PROCESS — the collected commands are classified, the ones that will not
+ *      run are acknowledged straight away, and only then does the hardware move.
+ *
+ * Within a single wake at most one command with an irreversible effect is
+ * executed: the first one that arrived. Every further one is acknowledged as
+ * DUPLICATE, exactly like a command whose ID had already been processed.
+ *
+ * The split matters because the hardware action blocks for several seconds.
+ * Executing it while commands were still unacknowledged in the broker queue
+ * left the MQTT session unserviced long enough for the broker to reset the TLS
+ * connection, which then lost the ACKs that had to follow.
+ *
  * IMPORTANT (PUBACK timing):
  * PubSubClient sends the QoS 1 PUBACK only AFTER the message callback returns.
- * The callback therefore does nothing but parse the command and store it; the
- * relay pulse, the MQTT ACK and the Telegram notification all run afterwards,
- * from setup(). Doing that slow work inside the callback would hold back the
- * PUBACK, and if the MQTT socket died in the meantime the broker would never
- * receive it and would re-deliver the same command on every reconnection.
+ * The callback therefore does nothing but parse the command and store it in the
+ * collection buffer; the relay pulse, the MQTT ACK and the Telegram
+ * notification all run afterwards, from setup(). Doing that slow work inside
+ * the callback would hold back the PUBACK, and if the MQTT socket died in the
+ * meantime the broker would never receive it and would re-deliver the same
+ * command on every reconnection.
  *
  * The Telegram notification is also deferred until after the MQTT connection is
  * closed: two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is
  * enough to make the handshake fail on an ESP32.
- *
- * Only ONE hardware action is performed per wake. Once a command has run, the
- * broker queue is drained before deep sleep: every further command is
- * acknowledged (so the broker stops re-delivering it) and discarded.
  *
  * New command types are added to COMMAND_TABLE; see the "Command dispatch"
  * section.
@@ -79,15 +94,17 @@ const int SERVO_CYCLES = 3;
 // Deep sleep duration: 2 minutes in microseconds
 const uint64_t DEEP_SLEEP_DURATION_US = 2ULL * 60 * 1000000;
 
-// MQTT awake timeout: wait this long for a message during wake
-const unsigned long MQTT_AWAKE_TIMEOUT_MS = 10000;
+// Command collection (phase 1). The collection loop waits up to
+// MQTT_COLLECT_IDLE_MS for the first message; once something has arrived it
+// keeps reading until the socket has been silent for MQTT_COLLECT_GRACE_MS, and
+// never runs longer than MQTT_COLLECT_MAX_MS.
+const unsigned long MQTT_COLLECT_IDLE_MS = 10000;
+const unsigned long MQTT_COLLECT_GRACE_MS = 500;
+const unsigned long MQTT_COLLECT_MAX_MS = 15000;
 
-// After a command has been executed, the broker queue is drained so that no
-// command is left unacknowledged before deep sleep. Draining stops once the
-// socket has been silent for MQTT_DRAIN_GRACE_MS, and never lasts longer than
-// MQTT_DRAIN_MAX_MS.
-const unsigned long MQTT_DRAIN_GRACE_MS = 500;
-const unsigned long MQTT_DRAIN_MAX_MS = 5000;
+// Commands buffered during a single wake. Anything beyond this has already been
+// PUBACKed by PubSubClient and is therefore lost, not deferred.
+const int MAX_COLLECTED_COMMANDS = 10;
 
 // Maximum number of processed command IDs to store
 const int MAX_PROCESSED_IDS = 20;
@@ -196,14 +213,29 @@ struct CommandDefinition {
   bool requiresReservation;
 };
 
-// Command parsed by the MQTT callback and executed later, outside of it.
-Message receivedCommand = {"", "", false};
-volatile bool commandReceived = false;
+// Commands collected during phase 1, in arrival order. The MQTT callback only
+// appends here; classification and execution happen later, from setup().
+Message collectedCommands[MAX_COLLECTED_COMMANDS];
+volatile int collectedCount = 0;
+
+// Commands that arrived with the buffer already full. They have been PUBACKed,
+// so the broker will not re-deliver them: they are lost, and reported as such.
+volatile int droppedCount = 0;
+
+// Set by the callback on every incoming message; the collection loop uses it to
+// know that the socket is still delivering and the grace period must restart.
+volatile bool messageReceived = false;
+
+// A failed publish after a long hardware action usually means the broker closed
+// the socket in the meantime. One reconnection per wake is attempted to rescue
+// the ACK; this flag keeps that from turning into a retry storm.
+bool mqttReconnectAttempted = false;
 
 // Telegram notifications are queued and only delivered once the MQTT connection
 // has been closed, so the two TLS sessions never compete for heap.
-// Worst case per wake: one recovery + one executed command + one drain summary.
-const int MAX_QUEUED_NOTIFICATIONS = 4;
+// Worst case per wake: one recovery + one executed command + the three
+// end-of-wake summaries (duplicates, unsupported, dropped).
+const int MAX_QUEUED_NOTIFICATIONS = 6;
 
 String notificationQueue[MAX_QUEUED_NOTIFICATIONS];
 int notificationCount = 0;
@@ -230,13 +262,22 @@ bool hasProcessedId(const String& id) {
   return list.indexOf("," + id + ",") != -1;
 }
 
-bool saveProcessedId(const String& id) {
+// Prepends the given IDs to the stored list, newest last, and truncates it to
+// MAX_PROCESSED_IDS. The whole batch costs a single flash write, which matters
+// when a burst of commands is acknowledged in one go.
+bool saveProcessedIds(const String* newIds, int count) {
+  if (count <= 0) {
+    return true;
+  }
+
   String ids = nvs.getString("cmd_ids", "");
 
-  if (ids.length() > 0) {
-    ids = id + "," + ids;
-  } else {
-    ids = id;
+  for (int i = 0; i < count; i++) {
+    if (ids.length() > 0) {
+      ids = newIds[i] + "," + ids;
+    } else {
+      ids = newIds[i];
+    }
   }
 
   // Keep only the last MAX_PROCESSED_IDS by counting backwards.
@@ -259,6 +300,10 @@ bool saveProcessedId(const String& id) {
 
   Serial.printf("[NVS] Processed IDs saved: %s\r\n", ids.c_str());
   return true;
+}
+
+bool saveProcessedId(const String& id) {
+  return saveProcessedIds(&id, 1);
 }
 
 bool reservePendingId(const String& id) {
@@ -448,6 +493,7 @@ const char* getMqttStateString(int state) {
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length);
+void connectMqtt();
 
 String formatNotification(const String& id, const String& result) {
   if (result == "OK") {
@@ -508,38 +554,55 @@ void flushNotifications() {
   notificationCount = 0;
 }
 
-// Publishes the MQTT ACK for a command. Set notify=false for results that must
-// not reach Telegram individually (for example each drained command, which is
-// summarised in a single message instead).
-bool publishAck(const String& id, const String& result, bool notify = true) {
-  bool mqttOk = false;
-
+// Publishes a single ACK message. Returns false when MQTT is unavailable or the
+// socket write fails.
+bool publishAckPayload(const String& id, const String& result) {
   if (!mqtt.connected()) {
     Serial.println("[ACK] MQTT not connected, cannot publish");
+    return false;
+  }
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo = gmtime(&now);
+  char timestamp[30];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"id\":\"%s\",\"result\":\"%s\",\"timestamp\":\"%s\"}",
+           id.c_str(), result.c_str(), timestamp);
+
+  // PubSubClient publish(topic, payload, length, retain): the library does
+  // not provide QoS 1 publishing through this overload. For this ACK we keep
+  // retain=false. The command itself is what uses QoS 1/persistent delivery.
+  //
+  // IMPORTANT: do not claim this ACK is QoS 1 if PubSubClient is configured
+  // only for QoS 0 publishing.
+  bool ok = mqtt.publish(MQTT_ACK_TOPIC, payload, false);
+
+  if (ok) {
+    Serial.printf("[ACK] Published (QoS 0, retain=false): %s\r\n", payload);
   } else {
-    time_t now = time(nullptr);
-    struct tm* timeinfo = gmtime(&now);
-    char timestamp[30];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+    Serial.println("[ACK] Failed to publish");
+  }
+  return ok;
+}
 
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-             "{\"id\":\"%s\",\"result\":\"%s\",\"timestamp\":\"%s\"}",
-             id.c_str(), result.c_str(), timestamp);
+// Publishes the MQTT ACK for a command. Set notify=false for results that must
+// not reach Telegram individually (for example each duplicate command, which is
+// summarised in a single message instead).
+bool publishAck(const String& id, const String& result, bool notify = true) {
+  bool mqttOk = publishAckPayload(id, result);
 
-    // PubSubClient publish(topic, payload, length, retain): the library does
-    // not provide QoS 1 publishing through this overload. For this ACK we keep
-    // retain=false. The command itself is what uses QoS 1/persistent delivery.
-    //
-    // IMPORTANT: do not claim this ACK is QoS 1 if PubSubClient is configured
-    // only for QoS 0 publishing.
-    mqttOk = mqtt.publish(MQTT_ACK_TOPIC, payload, false);
-
-    if (mqttOk) {
-      Serial.printf("[ACK] Published (QoS 0, retain=false): %s\r\n", payload);
-    } else {
-      Serial.println("[ACK] Failed to publish");
-    }
+  // A hardware action blocks for seconds, which is long enough for the broker
+  // to drop the socket. Reconnect once per wake so the outcome still reaches
+  // the publisher. Re-subscribing is harmless here: nothing calls mqtt.loop()
+  // after this point, so anything still queued stays queued for the next wake.
+  if (!mqttOk && !mqttReconnectAttempted && WiFi.status() == WL_CONNECTED) {
+    mqttReconnectAttempted = true;
+    Serial.println("[ACK] Publish failed; reconnecting once to retry");
+    connectMqtt();
+    mqttOk = publishAckPayload(id, result);
   }
 
   // Telegram is independent from the MQTT ACK, and is deferred until the MQTT
@@ -553,11 +616,13 @@ bool publishAck(const String& id, const String& result, bool notify = true) {
 // MQTT message callback.
 //
 // Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
-// only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). The
-// command is therefore only parsed and stored here; processReceivedCommand()
-// does the actual work once we are back in setup().
+// only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Commands
+// are therefore only parsed and appended to collectedCommands here;
+// processCollectedCommands() does the actual work once we are back in setup().
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
+
+  messageReceived = true;
 
   char rawPayload[512];
   if (length >= sizeof(rawPayload)) {
@@ -568,35 +633,36 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] Raw payload: %s\r\n", rawPayload);
   }
 
-  // Defensive: the wait loop stops calling mqtt.loop() as soon as a command is
-  // stored, so this should never happen. Dropping the message here would still
-  // PUBACK it and lose it, hence the warning.
-  if (commandReceived) {
-    Serial.println("[MQTT] WARNING: a command is already queued for this wake; message dropped");
-    return;
-  }
-
   Message msg = parseMessage(payload, length);
   if (!msg.valid) {
     Serial.println("[MSG] Missing id or command field");
     return;
   }
 
-  receivedCommand = msg;
-  commandReceived = true;
+  // The PUBACK for this message is already on its way, so a command that does
+  // not fit is gone for good rather than deferred to the next wake.
+  if (collectedCount >= MAX_COLLECTED_COMMANDS) {
+    droppedCount++;
+    Serial.printf("[MQTT] WARNING: collection buffer full, command dropped: %s\r\n", msg.id);
+    return;
+  }
+
+  collectedCommands[collectedCount] = msg;
+  collectedCount++;
 }
 
 // ===================== Command dispatch =======================
 //
 // To add a new command, write a handler returning true on success and append an
-// entry to COMMAND_TABLE. Nothing else needs to change: parsing, deduplication,
-// ACK, Telegram notification and queue draining are already generic.
+// entry to COMMAND_TABLE. Nothing else needs to change: collection, parsing,
+// deduplication, ACK and Telegram notification are already generic.
 //
 // requiresReservation marks commands with an irreversible physical effect. Those
 // go through the NVS PENDING reservation, which guarantees at-most-once
-// execution across a reset (see the file header). Read-only or idempotent
-// commands should set it to false: they are cheap to repeat and skip the two
-// extra flash writes.
+// execution across a reset (see the file header), and only the first one of a
+// batch is executed. Read-only or idempotent commands should set it to false:
+// they are cheap to repeat, skip the two extra flash writes, and every one of
+// them collected during a wake is executed.
 
 bool handleOpen() {
   pulseRelay();
@@ -619,28 +685,12 @@ const CommandDefinition* findCommand(const String& name) {
   return nullptr;
 }
 
-// Executes the command stored by onMqttMessage(). Must run outside the MQTT
-// callback, so that the PUBACK for this command has already left the device
-// before the slow work (hardware action, ACK, notification) starts.
-void processReceivedCommand() {
-  String id(receivedCommand.id);
-  String command(receivedCommand.command);
-
-  Serial.printf("[MSG] id=%s, command=%s\r\n", receivedCommand.id, receivedCommand.command);
-
-  // Deduplication check.
-  if (hasProcessedId(id)) {
-    Serial.printf("[CMD] DUPLICATE id=%s\r\n", id.c_str());
-    publishAck(id, "DUPLICATE");
-    return;
-  }
-
-  const CommandDefinition* definition = findCommand(command);
-  if (definition == nullptr) {
-    Serial.printf("[CMD] Unsupported command: %s\r\n", command.c_str());
-    publishAck(id, "UNKNOWN_COMMAND");
-    return;
-  }
+// Runs one collected command and publishes its ACK. Must run outside the MQTT
+// callback, and after the collection phase, so that the PUBACK for every queued
+// command has already left the device before the slow work starts.
+void executeCommand(const Message& message, const CommandDefinition* definition) {
+  String id(message.id);
+  String command(message.command);
 
   // Commands with no irreversible effect run directly: re-executing them after
   // a reset is harmless, so they need no PENDING reservation.
@@ -690,75 +740,168 @@ void processReceivedCommand() {
   publishAck(id, ok ? "OK" : "FAILED");
 }
 
-// Acknowledges and throws away a command that arrived after the one already
-// executed during this wake.
-void discardQueuedCommand() {
-  String id(receivedCommand.id);
-
-  Serial.printf("[CMD] Discarding queued command id=%s command=%s\r\n",
-                receivedCommand.id, receivedCommand.command);
-
-  // Store the ID even though nothing was executed: if the PUBACK were lost, the
-  // broker would re-deliver this command on a later wake, where it would be
-  // executed for real. The processed-ID list is what blocks that.
-  if (!saveProcessedId(id)) {
-    Serial.println("[CMD] WARNING: discarded command could not be added to the processed-ID list");
+// True when the same command ID already appears earlier in the collected batch,
+// which happens when the broker re-delivers a message whose PUBACK was lost.
+bool isRepeatedInBatch(int index, const String& id) {
+  for (int i = 0; i < index; i++) {
+    if (id == collectedCommands[i].id) {
+      return true;
+    }
   }
-
-  // MQTT ACK only: the publisher still learns the outcome, but each discarded
-  // command does not become its own Telegram message.
-  publishAck(id, "DISCARDED", false);
+  return false;
 }
 
-// Drains the commands the broker still has queued for us, so that none is left
-// unacknowledged when the ESP32 goes back to deep sleep. Every message read here
-// is PUBACKed by PubSubClient and then discarded: only one hardware action is
-// allowed per wake.
-void drainQueuedCommands() {
-  Serial.println("[MQTT] Draining queued commands before sleep");
+// Phase 1: read every command the broker has queued for us. PubSubClient
+// PUBACKs each message as soon as the callback returns, so after this function
+// the broker considers the queue delivered and will not repeat it at the next
+// wake. Nothing is executed here — commands are only buffered.
+void collectQueuedCommands() {
+  Serial.printf("[MQTT] Collecting queued commands (idle timeout=%lu ms)\r\n", MQTT_COLLECT_IDLE_MS);
 
-  unsigned long drainStart = millis();
-  unsigned long lastActivity = millis();
-  int discarded = 0;
+  unsigned long start = millis();
+  unsigned long lastActivity = start;
 
-  while (millis() - drainStart < MQTT_DRAIN_MAX_MS) {
+  while (millis() - start < MQTT_COLLECT_MAX_MS) {
     if (!mqtt.connected()) {
-      Serial.println("[MQTT] Connection lost while draining");
+      Serial.println("[MQTT] Connection lost while collecting");
       break;
     }
 
-    commandReceived = false;
+    messageReceived = false;
     mqtt.loop();
-
-    if (commandReceived) {
-      discardQueuedCommand();
-      discarded++;
-      lastActivity = millis();
-      continue;
-    }
 
     // Bytes already decrypted and waiting: another packet is on its way, so keep
     // reading without burning the grace period.
-    if (tlsClient.available() > 0) {
+    if (messageReceived || tlsClient.available() > 0) {
       lastActivity = millis();
       continue;
     }
 
-    if (millis() - lastActivity >= MQTT_DRAIN_GRACE_MS) {
+    // Nothing arrived yet: wait the full idle timeout. Once the first message is
+    // in, a short silence is enough to declare the queue empty.
+    bool anythingArrived = (collectedCount > 0 || droppedCount > 0);
+    unsigned long allowedIdle = anythingArrived ? MQTT_COLLECT_GRACE_MS : MQTT_COLLECT_IDLE_MS;
+    if (millis() - lastActivity >= allowedIdle) {
       break;
     }
 
     delay(20);
   }
 
-  commandReceived = false;
+  Serial.printf("[MQTT] Collection ended after %lu ms: %d collected, %d dropped\r\n",
+                millis() - start, collectedCount, droppedCount);
+}
 
-  if (discarded > 0) {
-    Serial.printf("[MQTT] Drain complete, %d queued command(s) discarded\r\n", discarded);
-    queueMessage("⚠️ OpenGate: " + String(discarded) +
-                 " further queued command(s) acknowledged and discarded");
-  } else {
-    Serial.println("[MQTT] Drain complete, no queued commands left");
+// Phase 2: classify the collected commands and run at most one irreversible
+// action — the first that arrived. Everything that will not run is
+// acknowledged first, while the socket is still fresh, because the hardware
+// action afterwards blocks for seconds and may outlive the connection.
+void processCollectedCommands() {
+  if (collectedCount == 0 && droppedCount == 0) {
+    Serial.println("[MSG] No command received");
+    return;
+  }
+
+  // ---- Pass 1: decide, without touching the hardware or the flash. ----
+  // plan[i] == nullptr means "not executed"; results[i] is then its ACK result.
+  const CommandDefinition* plan[MAX_COLLECTED_COMMANDS];
+  String results[MAX_COLLECTED_COMMANDS];
+  bool persist[MAX_COLLECTED_COMMANDS];
+
+  bool actionSelected = false;
+  int duplicates = 0;
+  int unsupported = 0;
+
+  for (int i = 0; i < collectedCount; i++) {
+    String id(collectedCommands[i].id);
+    String command(collectedCommands[i].command);
+
+    plan[i] = nullptr;
+    persist[i] = false;
+
+    Serial.printf("[MSG] id=%s, command=%s\r\n", id.c_str(), command.c_str());
+
+    // Already handled in an earlier wake, or the very same ID delivered twice.
+    // Either way its ID is already on record, so nothing needs persisting.
+    if (isRepeatedInBatch(i, id) || hasProcessedId(id)) {
+      Serial.printf("[CMD] DUPLICATE id=%s\r\n", id.c_str());
+      results[i] = "DUPLICATE";
+      duplicates++;
+      continue;
+    }
+
+    const CommandDefinition* definition = findCommand(command);
+    if (definition == nullptr) {
+      Serial.printf("[CMD] Unsupported command: %s\r\n", command.c_str());
+      results[i] = "UNKNOWN_COMMAND";
+      persist[i] = true;
+      unsupported++;
+      continue;
+    }
+
+    // Only the first irreversible command of the batch runs. A burst of OPENs
+    // means the button was pressed repeatedly, not that the gate must cycle
+    // once per press, so the rest count as duplicates.
+    if (definition->requiresReservation && actionSelected) {
+      Serial.printf("[CMD] An action is already scheduled for this wake, treating as duplicate: id=%s\r\n",
+                    id.c_str());
+      results[i] = "DUPLICATE";
+      persist[i] = true;
+      duplicates++;
+      continue;
+    }
+
+    if (definition->requiresReservation) {
+      actionSelected = true;
+    }
+    plan[i] = definition;
+  }
+
+  // ---- Pass 2: commit and acknowledge everything that will not run. ----
+  // Their PUBACK has already been sent, but it may have been lost with the
+  // socket; the processed-ID list is what stops a re-delivery from opening the
+  // gate at a later wake.
+  String skippedIds[MAX_COLLECTED_COMMANDS];
+  int skippedCount = 0;
+  for (int i = 0; i < collectedCount; i++) {
+    if (plan[i] == nullptr && persist[i]) {
+      skippedIds[skippedCount] = String(collectedCommands[i].id);
+      skippedCount++;
+    }
+  }
+
+  if (!saveProcessedIds(skippedIds, skippedCount)) {
+    Serial.println("[CMD] WARNING: skipped commands could not be added to the processed-ID list");
+  }
+
+  // MQTT ACK only: the publisher still learns the outcome, but a burst of
+  // button presses does not become a burst of Telegram messages.
+  for (int i = 0; i < collectedCount; i++) {
+    if (plan[i] == nullptr) {
+      publishAck(String(collectedCommands[i].id), results[i], false);
+    }
+  }
+
+  // ---- Pass 3: execute. ----
+  for (int i = 0; i < collectedCount; i++) {
+    if (plan[i] != nullptr) {
+      executeCommand(collectedCommands[i], plan[i]);
+    }
+  }
+
+  // ---- Pass 4: one summary per category instead of one message per command. ----
+  if (duplicates > 0) {
+    queueMessage("⚠️ OpenGate: " + String(duplicates) +
+                 " duplicate command(s) acknowledged and ignored");
+  }
+  if (unsupported > 0) {
+    queueMessage("⚠️ OpenGate: " + String(unsupported) +
+                 " unsupported command(s) acknowledged and ignored");
+  }
+  if (droppedCount > 0) {
+    queueMessage("❌ OpenGate: " + String(droppedCount) +
+                 " command(s) lost, more than " + String(MAX_COLLECTED_COMMANDS) +
+                 " arrived in a single wake");
   }
 }
 
@@ -943,50 +1086,19 @@ void setup() {
   connectMqtt();
 
   if (!mqtt.connected()) {
-    Serial.println("[MQTT] ERROR: Not connected to MQTT broker, skipping wait");
+    Serial.println("[MQTT] ERROR: Not connected to MQTT broker, skipping this wake");
   } else {
     // Recover a hardware transaction interrupted by a reset before listening for
     // new messages, so the pending command cannot be executed a second time.
     recoverPendingCommand();
 
-    // Wait for a new command with timeout.
-    commandReceived = false;
-    unsigned long startTime = millis();
-    unsigned long loopCount = 0;
+    // Phase 1: read and acknowledge everything the broker has queued, so the
+    // next wake starts from an empty queue.
+    collectQueuedCommands();
 
-    Serial.printf("[MQTT] Waiting for command (timeout=%lu ms)\r\n", MQTT_AWAKE_TIMEOUT_MS);
-
-    while (millis() - startTime < MQTT_AWAKE_TIMEOUT_MS) {
-      if (!mqtt.connected()) {
-        Serial.println("[MQTT] Connection lost during wait");
-        break;
-      }
-
-      mqtt.loop();
-      loopCount++;
-
-      // mqtt.loop() has already written the PUBACK for this command.
-      if (commandReceived) {
-        break;
-      }
-
-      delay(50);
-    }
-
-    Serial.printf("[MQTT] Wait ended after %lu ms (%lu loops)\r\n", millis() - startTime, loopCount);
-
-    // From here on the only caller of mqtt.loop() is drainQueuedCommands(),
-    // which acknowledges and discards whatever else the broker has queued. That
-    // guarantees nothing is left unacknowledged when we go back to sleep, while
-    // still allowing only one hardware action per wake.
-    if (commandReceived) {
-      processReceivedCommand();
-      drainQueuedCommands();
-    } else {
-      // The wait loop already polled the broker for MQTT_AWAKE_TIMEOUT_MS
-      // without receiving anything, so there is nothing queued to drain.
-      Serial.println("[MSG] No command received");
-    }
+    // Phase 2: decide and execute. mqtt.loop() is never called again from here
+    // on, so no new message can arrive while the hardware is busy.
+    processCollectedCommands();
 
     if (mqtt.connected()) {
       mqtt.disconnect();
