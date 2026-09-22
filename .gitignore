@@ -35,3 +35,8 @@ local/venv/
 local/__pycache__/
 local/*.py[cod]
 local/esp32_nvs_sim.json
+
+# ULP build artifacts
+src/ulp/*.bin
+src/ulp/*.elf
+src/ulp/*.o
