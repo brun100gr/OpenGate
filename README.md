@@ -8,12 +8,12 @@ topic closes a relay wired to the gate control board.
 Phone / Android Auto ──(MQTT/TLS, mobile network)──► HiveMQ Cloud ──(MQTT/TLS, WiFi)──► ESP32 ──► relay ──► gate control board
 ```
 
-Repository layout:
+## Repository Layout
 
 - `android/` — Android app in Kotlin (phone UI + Android Auto, IOT category)
 - `esp32/opengate/` — Arduino sketch for the ESP32
 
-## Secrets
+## Credentials
 
 Credentials never reach the repository: the real configuration files are
 gitignored, and only `.example` templates are committed.
@@ -49,7 +49,7 @@ before deploying to production.
 
 ---
 
-## 1. MQTT broker (HiveMQ Cloud)
+## 1. MQTT Broker (HiveMQ Cloud)
 
 1. Sign up at <https://console.hivemq.cloud> and create a **Serverless
    (free)** cluster: it includes TLS and is reachable from the Internet, so
@@ -64,7 +64,7 @@ before deploying to production.
    If the free plan does not allow granular permissions, that's fine: still
    use two distinct users with strong passwords.
 
-## 2. Android app
+## 2. Android App
 
 You need [Android Studio](https://developer.android.com/studio) (it downloads
 the proper SDK and JDK on its own).
@@ -81,7 +81,7 @@ the proper SDK and JDK on its own).
    options) and press **Run ▶**. The app appears on the phone: a single
    "Open gate" button.
 
-### Enabling the app on Android Auto (without the Play Store)
+### Enabling the App on Android Auto (without the Play Store)
 
 Apps not coming from the Play Store must be explicitly enabled:
 
@@ -112,16 +112,23 @@ Apps not coming from the Play Store must be explicitly enabled:
 3. Upload the sketch and open the serial monitor at 115200 baud: it should
    print `WiFi OK`, `Connecting to MQTT... OK`, `Subscribed to opengate/cmd`.
 
-### TLS certificate
+### TLS Certificates
 
-HiveMQ Cloud uses Let's Encrypt certificates. For full server verification,
-download the **ISRG Root X1** root CA (PEM format) from
-<https://letsencrypt.org/certificates/> and paste the
-`-----BEGIN CERTIFICATE----- … -----END CERTIFICATE-----` block into the
-`ROOT_CA` constant in `secrets.h`. If you leave the placeholder, the sketch
-uses `setInsecure()`: traffic is still encrypted but the ESP32 does not
-verify it is talking to the real broker — acceptable for early testing, to
-be fixed before real use.
+Root CA certificates live in `esp32/opengate/src/certificates.h`. They are
+public CA material, not secrets, so that file is committed to the repository —
+you normally do not need to touch it.
+
+- `MQTT_ROOT_CA` — **ISRG Root X1**, the Let's Encrypt trust anchor used by
+  HiveMQ Cloud (<https://letsencrypt.org/certificates/>). If this is ever
+  replaced by a non-certificate placeholder, the sketch falls back to
+  `setInsecure()`: traffic is still encrypted but the ESP32 does not verify it
+  is talking to the real broker.
+- `TELEGRAM_ROOT_CA` — **Go Daddy Root Certificate Authority - G2**, the trust
+  anchor currently used by `api.telegram.org`. There is no insecure fallback
+  here: a missing certificate just means notifications stop working.
+
+Update a certificate here when the corresponding service rotates its trust
+anchor.
 
 ### Wiring
 
@@ -155,13 +162,13 @@ To test the Android Auto UI without a physical vehicle, use the **Desktop Head U
    - Find and install *Android Auto Desktop Head Unit Emulator*
    - The executable lands in `[SDK_PATH]/extras/google/auto/`
 
-2. **Prepare the phone**:
+2. **Prepare the Phone**:
    - Open *Android Auto settings* (search in phone settings or open the Android Auto app)
    - Scroll to the bottom and tap **Version** 10 times to unlock developer settings
    - Open the menu ⋮ and select **Start head unit server**
    - You should see a persistent notification: "Head unit server running"
 
-3. **Connect and launch**:
+3. **Connect and Launch**:
    - Connect the phone to your PC via USB
    - Open a terminal and set up ADB port forwarding:
      ```sh
@@ -187,7 +194,7 @@ If your system lacks GLIBC 2.32+:
    ENTRYPOINT ["./desktop-head-unit"]
    ```
 
-2. **Build the image**:
+2. **Build the Image**:
    ```sh
    docker build -t android-dhu .
    ```
@@ -205,7 +212,7 @@ If your system lacks GLIBC 2.32+:
 
 The phone and DHU should auto-connect; you'll see the OpenGate grid with the "Open gate" button on the emulated car screen.
 
-## 5. End-to-end test
+## 5. End-to-End Test
 
 1. ESP32 powered and connected (serial monitor open).
 2. From the phone app press **Open gate** → the app shows "Command sent ✓",
@@ -222,7 +229,7 @@ mosquitto_pub -h YOUR_CLUSTER.s1.eu.hivemq.cloud -p 8883 \
   -t opengate/cmd -m open
 ```
 
-## 6. Security notes
+## 6. Security Notes
 
 This command opens your home, so:
 

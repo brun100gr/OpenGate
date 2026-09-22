@@ -1,70 +1,71 @@
 /*
  * OpenGate — gate side (ESP32)
  *
- * Intermittently wakes from deep sleep (2 min intervals), connects to WiFi and MQTT,
- * waits for a command, executes it with durable command reservation/deduplication (NVS),
- * publishes an MQTT ACK, sends a Telegram notification, and returns to deep sleep.
+ * Wakes from deep sleep every DEEP_SLEEP_SECONDS, connects to WiFi and MQTT,
+ * collects the commands the broker has queued, executes at most one of them,
+ * publishes an MQTT ACK, sends a Telegram notification and goes back to sleep.
  *
- * MQTT uses a persistent session (clean-session=false) with a fixed client ID,
- * allowing queued QoS 1 commands published while the ESP32 is offline to be
- * delivered upon wake.
+ * MQTT uses a persistent session (cleanSession=false) with a fixed client ID, so
+ * QoS 1 commands published while the ESP32 was asleep are delivered on wake.
  *
- * IMPORTANT:
- * MQTT QoS 1 gives at-least-once delivery. The command transaction below therefore
- * implements an AT-MOST-ONCE hardware action across resets:
+ * --------------------------------------------------------------------------
+ * DESIGN NOTE 1 — at-most-once hardware action
  *
- *   1. Persist command as PENDING in NVS.
- *   2. Activate the relay.
- *   3. Persist command as PROCESSED and clear PENDING.
- *   4. Publish ACK + Telegram notification.
+ * MQTT QoS 1 is at-least-once, so the command transaction turns it into an
+ * AT-MOST-ONCE hardware action that survives a reset:
  *
- * If the ESP32 resets after step 1, the command is deliberately NOT executed again
- * on the next boot. Without a physical gate-position/relay feedback signal, it is
- * impossible to know whether a reset happened before or after the relay pulse.
- * This design therefore prefers preventing a possible second gate opening over
- * guaranteeing that every command is eventually executed.
+ *   1. Persist the command as PENDING in NVS.
+ *   2. Run the handler (relay pulse, servo, ...).
+ *   3. Persist the command as PROCESSED and clear PENDING.
+ *   4. Publish the ACK and queue the Telegram notification.
  *
- * IMPORTANT (wake flow):
- * Each wake is split into two distinct phases:
+ * If the ESP32 resets after step 1 the command is deliberately NOT executed
+ * again on the next boot: without a gate-position or relay feedback signal it is
+ * impossible to know whether the reset happened before or after the pulse. This
+ * design prefers a missed opening over a second, unwanted one.
  *
- *   1. COLLECT — every command the broker has queued is read and PUBACKed, so
- *      none of them is delivered again at the next wake. Nothing is executed
- *      and no hardware moves during this phase.
+ * --------------------------------------------------------------------------
+ * DESIGN NOTE 2 — the wake is split into two phases
+ *
+ *   1. COLLECT — every queued command is read and PUBACKed, so none of them is
+ *      delivered again at the next wake. Nothing is executed, no hardware moves.
  *   2. PROCESS — the collected commands are classified, the ones that will not
- *      run are acknowledged straight away, and only then does the hardware move.
+ *      run are acknowledged first, and only then does the hardware move.
  *
- * Within a single wake at most one command with an irreversible effect is
- * executed: the first one that arrived. Every further one is acknowledged as
- * DUPLICATE, exactly like a command whose ID had already been processed.
+ * Within a single wake at most one command with an irreversible effect runs: the
+ * first that arrived. Every further one is acknowledged as DUPLICATE, exactly
+ * like a command whose ID had already been processed.
  *
  * The split matters because the hardware action blocks for several seconds.
- * Executing it while commands were still unacknowledged in the broker queue
- * left the MQTT session unserviced long enough for the broker to reset the TLS
+ * Executing it while commands were still unacknowledged in the broker queue left
+ * the MQTT session unserviced long enough for the broker to reset the TLS
  * connection, which then lost the ACKs that had to follow.
  *
- * IMPORTANT (PUBACK timing):
+ * --------------------------------------------------------------------------
+ * DESIGN NOTE 3 — PUBACK and heap timing
+ *
  * PubSubClient sends the QoS 1 PUBACK only AFTER the message callback returns.
- * The callback therefore does nothing but parse the command and store it in the
- * collection buffer; the relay pulse, the MQTT ACK and the Telegram
- * notification all run afterwards, from setup(). Doing that slow work inside
- * the callback would hold back the PUBACK, and if the MQTT socket died in the
- * meantime the broker would never receive it and would re-deliver the same
- * command on every reconnection.
+ * onMqttMessage() therefore does nothing but parse a command and buffer it; the
+ * hardware action, the ACK and the notification all run later, from setup().
+ * Slow work inside the callback would hold back the PUBACK, and if the socket
+ * died meanwhile the broker would re-deliver the same command forever.
  *
- * The Telegram notification is also deferred until after the MQTT connection is
- * closed: two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is
- * enough to make the handshake fail on an ESP32.
+ * Telegram notifications are deferred until after the MQTT connection is closed:
+ * two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is enough
+ * to make the handshake fail on an ESP32.
  *
- * New command types are added to COMMAND_TABLE; see the "Command dispatch"
- * section.
+ * --------------------------------------------------------------------------
+ * Adding a command: write a handler and append one entry to COMMAND_TABLE (see
+ * the "Command dispatch" section). Nothing else needs to change.
  *
- * Credentials and certificates live in secrets.h (gitignored): copy
- * secrets.h.example to secrets.h and fill in your values.
+ * Credentials live in secrets.h (gitignored): copy secrets.h.example to
+ * secrets.h and fill in your values. Root CAs live in certificates.h.
  *
- * Required libraries (Arduino IDE Library Manager):
- *   - PubSubClient (Nick O'Leary)
- *   - UniversalTelegramBot
- *   - WiFi, WiFiClientSecure, and Preferences are included in the ESP32 core.
+ * Required libraries (see platformio.ini):
+ *   - PubSubClient (knolleary)
+ *   - UniversalTelegramBot (witnessmenow)
+ *   - ESP32Servo (madhephaestus)
+ *   - WiFi, WiFiClientSecure and Preferences ship with the ESP32 core.
  */
 
 #include <WiFi.h>
@@ -75,29 +76,51 @@
 #include <ESP32Servo.h>
 #include <time.h>
 
+#include "certificates.h"
 #include "secrets.h"
 
 // ======================== Configuration ========================
 
+// --- MQTT ---
 const char* MQTT_CMD_TOPIC = "opengate/cmd";
 const char* MQTT_ACK_TOPIC = "opengate/ack";
+const int MQTT_CONNECT_ATTEMPTS = 3;
+const unsigned long MQTT_RETRY_DELAY_MS = 1000;
+const uint16_t MQTT_KEEPALIVE_S = 30;
 
+// Largest command payload we are willing to parse. Payloads above PubSubClient's
+// own MQTT_MAX_PACKET_SIZE never reach the callback in the first place.
+const unsigned int MQTT_MAX_PAYLOAD_LEN = 512;
+
+// --- Hardware ---
 const int RELAY_PIN = 26;
-const unsigned long PULSE_MS = 1000;
+const unsigned long RELAY_PULSE_MS = 1000;
 
 const int SERVO_PIN = 25;
-const int SERVO_ANGLE = 90;
+const int SERVO_ANGLE_REST = 0;
+const int SERVO_ANGLE_ACTIVE = 90;
 const unsigned long SERVO_MOVE_DELAY_MS = 2000;
 const unsigned long SERVO_RETURN_DELAY_MS = 1000;
 const int SERVO_CYCLES = 3;
 
-// Deep sleep duration: 2 minutes in microseconds
-const uint64_t DEEP_SLEEP_DURATION_US = 2ULL * 60 * 1000000;
+// --- Connectivity ---
+const unsigned long SERIAL_BAUD = 115200;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
+const unsigned long TLS_TIMEOUT_MS = 5000;
 
-// Command collection (phase 1). The collection loop waits up to
-// MQTT_COLLECT_IDLE_MS for the first message; once something has arrived it
-// keeps reading until the socket has been silent for MQTT_COLLECT_GRACE_MS, and
-// never runs longer than MQTT_COLLECT_MAX_MS.
+// System time is required for certificate validity checks.
+const char* NTP_SERVER = "pool.ntp.org";
+const unsigned long TIME_SYNC_TIMEOUT_MS = 5000;
+const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; only used as a sanity check
+
+// --- Deep sleep ---
+const uint32_t DEEP_SLEEP_SECONDS = 120;
+const uint64_t DEEP_SLEEP_DURATION_US = (uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL;
+
+// --- Command collection (phase 1) ---
+// The collection loop waits up to MQTT_COLLECT_IDLE_MS for the first message;
+// once something has arrived it keeps reading until the socket has been silent
+// for MQTT_COLLECT_GRACE_MS, and never runs longer than MQTT_COLLECT_MAX_MS.
 const unsigned long MQTT_COLLECT_IDLE_MS = 10000;
 const unsigned long MQTT_COLLECT_GRACE_MS = 500;
 const unsigned long MQTT_COLLECT_MAX_MS = 15000;
@@ -106,84 +129,35 @@ const unsigned long MQTT_COLLECT_MAX_MS = 15000;
 // PUBACKed by PubSubClient and is therefore lost, not deferred.
 const int MAX_COLLECTED_COMMANDS = 10;
 
-// Maximum number of processed command IDs to store
+// Maximum number of processed command IDs kept in NVS.
 const int MAX_PROCESSED_IDS = 20;
 
-// System time is required for certificate validity checks.
-const char* NTP_SERVER = "pool.ntp.org";
-const unsigned long TIME_SYNC_TIMEOUT_MS = 5000;
-const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; only used as a sanity check
+// Worst case per wake: one recovery + one executed command + the three
+// end-of-wake summaries (duplicates, unsupported, dropped).
+const int MAX_QUEUED_NOTIFICATIONS = 6;
 
-// Root CA used to validate api.telegram.org.
-// The currently observed api.telegram.org certificate chain is issued by
-// GoDaddy Secure Certificate Authority - G2, whose trust anchor is
-// Go Daddy Root Certificate Authority - G2. Keep this certificate in the
-// source tree because it is public CA material, not a secret.
-static const char TELEGRAM_ROOT_CA[] PROGMEM = R"EOF(-----BEGIN CERTIFICATE-----
-MIIDxTCCAq2gAwIBAgIBADANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCVVMx
-EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxGjAYBgNVBAoT
-EUdvRGFkZHkuY29tLCBJbmMuMTEwLwYDVQQDEyhHbyBEYWRkeSBSb290IENlcnRp
-ZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5MDkwMTAwMDAwMFoXDTM3MTIzMTIz
-NTk1OVowgYMxCzAJBgNVBAYTAlVTMRAwDgYDVQQIEwdBcml6b25hMRMwEQYDVQQH
-EwpTY290dHNkYWxlMRowGAYDVQQKExFHb0RhZGR5LmNvbSwgSW5jLjExMC8GA1UE
-AxMoR28gRGFkZHkgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIw
-DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAL9xYgjx+lk09xvJGKP3gElY6SKD
-E6bFIEMBO4Tx5oVJnyfq9oQbTqC023CYxzIBsQU+B07u9PpPL1kwIuerGVZr4oAH
-/PMWdYA5UXvl+TW2dE6pjYIT5LY/qQOD+qK+ihVqf94Lw7YZFAXK6sOoBJQ7Rnwy
-DfMAZiLIjWltNowRGLfTshxgtDj6AozO091GB94KPutdfMh8+7ArU6SSYmlRJQVh
-GkSBjCypQ5Yj36w6gZoOKcUcqeldHraenjAKOc7xiID7S13MMuyFYkMlNAJWJwGR
-tDtwKj9useiciAF9n9T521NtYJ2/LOdYq7hfRvzOxBsDPAnrSTFcaUaz4EcCAwEA
-AaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYE
-FDqahQcQZyi27/a9BUFuIMGU2g/eMA0GCSqGSIb3DQEBCwUAA4IBAQCZ21151fmX
-WWcDYfF+OwYxdS2hII5PZYe096acvNjpL9DbWu7PdIxztDhC2gV7+AJ1uP2lsdeu
-9tfeE8tTEH6KRtGX+rcuKxGrkLAngPnon1rpN5+r5N9ss4UXnT3ZJE95kTXWXwTr
-gIOrmgIttRD02JDHBHNA7XIloKmf7J6raBKZV8aPEjoJpL1E/QYVN8Gb5DKj7Tjo
-2GTzLH4U/ALqn83/B2gX2yKQOC16jdFU8WnjXzPKej17CuPKf1855eJ1usV2GDPO
-LPAvTK33sefOT6jEm0pUBsV/fdUID+Ic/n4XuKxe9tQWskMJDE32p2u0mYRlynqI
-4uJEvlz36hz1
------END CERTIFICATE-----
-)EOF";
+// =========================== Types =============================
+//
+// These live here, ahead of every function, because the Arduino build
+// auto-generates function prototypes at the top of the .ino: a type used in a
+// signature must already be known at that point.
 
-// Broker root CA (for HiveMQ Cloud: Let's Encrypt "ISRG Root X1").
-// Paste the PEM certificate here — see README, "TLS certificate" section.
-// If you leave the placeholder, the sketch falls back to setInsecure():
-// the connection is encrypted but the server identity is NOT verified
-// (vulnerable to MITM).
-const char* ROOT_CA = R"EOF(
------BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
-TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
-cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
-WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
-ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
-MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
-h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
-0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
-A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
-T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
-B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
-B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
-KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
-OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
-jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
-qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
-rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
-HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
-hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
-ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
-3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
-NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
-ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
-TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
-jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
-oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
-4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
-mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
-emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
------END CERTIFICATE-----
-)EOF";
+struct Message {
+  char id[64];
+  char command[32];
+};
 
-// =================================================================
+// Performs the hardware action for one command type; returns true on success.
+typedef bool (*CommandHandler)();
+
+// One entry of COMMAND_TABLE — see the "Command dispatch" section.
+struct CommandDefinition {
+  const char* name;
+  CommandHandler handler;
+  bool requiresReservation;
+};
+
+// ======================== Global state =========================
 
 WiFiClientSecure tlsClient;
 PubSubClient mqtt(tlsClient);
@@ -196,35 +170,18 @@ Servo servo;
 Preferences nvs;
 String clientId;
 
-struct Message {
-  char id[64];
-  char command[32];
-  bool valid;
-};
-
-// A command handler performs the hardware action for one command type and
-// returns true on success. See the "Command dispatch" section for the table
-// that binds handlers to command names.
-typedef bool (*CommandHandler)();
-
-struct CommandDefinition {
-  const char* name;
-  CommandHandler handler;
-  bool requiresReservation;
-};
-
 // Commands collected during phase 1, in arrival order. The MQTT callback only
 // appends here; classification and execution happen later, from setup().
 Message collectedCommands[MAX_COLLECTED_COMMANDS];
-volatile int collectedCount = 0;
+int collectedCount = 0;
 
 // Commands that arrived with the buffer already full. They have been PUBACKed,
 // so the broker will not re-deliver them: they are lost, and reported as such.
-volatile int droppedCount = 0;
+int droppedCount = 0;
 
 // Set by the callback on every incoming message; the collection loop uses it to
 // know that the socket is still delivering and the grace period must restart.
-volatile bool messageReceived = false;
+bool messageReceived = false;
 
 // A failed publish after a long hardware action usually means the broker closed
 // the socket in the meantime. One reconnection per wake is attempted to rescue
@@ -233,10 +190,6 @@ bool mqttReconnectAttempted = false;
 
 // Telegram notifications are queued and only delivered once the MQTT connection
 // has been closed, so the two TLS sessions never compete for heap.
-// Worst case per wake: one recovery + one executed command + the three
-// end-of-wake summaries (duplicates, unsupported, dropped).
-const int MAX_QUEUED_NOTIFICATIONS = 6;
-
 String notificationQueue[MAX_QUEUED_NOTIFICATIONS];
 int notificationCount = 0;
 
@@ -256,13 +209,13 @@ bool hasProcessedId(const String& id) {
     return false;
   }
 
-  // IDs are stored as a comma-separated list. Search for a complete entry
-  // to avoid false positives from partial matches.
+  // IDs are stored as a comma-separated list. Search for a complete entry to
+  // avoid false positives from partial matches.
   String list = "," + ids + ",";
   return list.indexOf("," + id + ",") != -1;
 }
 
-// Prepends the given IDs to the stored list, newest last, and truncates it to
+// Prepends the given IDs to the stored list, newest first, and truncates it to
 // MAX_PROCESSED_IDS. The whole batch costs a single flash write, which matters
 // when a burst of commands is acknowledged in one go.
 bool saveProcessedIds(const String* newIds, int count) {
@@ -273,14 +226,10 @@ bool saveProcessedIds(const String* newIds, int count) {
   String ids = nvs.getString("cmd_ids", "");
 
   for (int i = 0; i < count; i++) {
-    if (ids.length() > 0) {
-      ids = newIds[i] + "," + ids;
-    } else {
-      ids = newIds[i];
-    }
+    ids = ids.isEmpty() ? newIds[i] : newIds[i] + "," + ids;
   }
 
-  // Keep only the last MAX_PROCESSED_IDS by counting backwards.
+  // Keep only the newest MAX_PROCESSED_IDS by counting separators backwards.
   int commaCount = 0;
   for (int i = ids.length() - 1; i >= 0; i--) {
     if (ids[i] == ',') {
@@ -292,8 +241,7 @@ bool saveProcessedIds(const String* newIds, int count) {
     }
   }
 
-  size_t written = nvs.putString("cmd_ids", ids);
-  if (written == 0) {
+  if (nvs.putString("cmd_ids", ids) == 0) {
     Serial.println("[NVS] ERROR: failed to save processed command ID");
     return false;
   }
@@ -306,10 +254,14 @@ bool saveProcessedId(const String& id) {
   return saveProcessedIds(&id, 1);
 }
 
-bool reservePendingId(const String& id) {
-  String pending = nvs.getString("pending_id", "");
+String getPendingId() {
+  return nvs.getString("pending_id", "");
+}
 
-  // If a different command is already pending, do not execute another hardware action.
+bool reservePendingId(const String& id) {
+  String pending = getPendingId();
+
+  // If a different command is already pending, do not start another hardware action.
   if (!pending.isEmpty() && pending != id) {
     Serial.printf("[NVS] ERROR: another command is pending: %s\r\n", pending.c_str());
     return false;
@@ -319,15 +271,13 @@ bool reservePendingId(const String& id) {
     return true;
   }
 
-  size_t written = nvs.putString("pending_id", id);
-  if (written == 0) {
+  if (nvs.putString("pending_id", id) == 0) {
     Serial.println("[NVS] ERROR: failed to persist pending command");
     return false;
   }
 
   // Read back to verify that the reservation is durable from our point of view.
-  String verify = nvs.getString("pending_id", "");
-  if (verify != id) {
+  if (getPendingId() != id) {
     Serial.println("[NVS] ERROR: pending command verification failed");
     return false;
   }
@@ -337,7 +287,7 @@ bool reservePendingId(const String& id) {
 }
 
 bool clearPendingId(const String& expectedId) {
-  String pending = nvs.getString("pending_id", "");
+  String pending = getPendingId();
 
   if (pending.isEmpty()) {
     return true;
@@ -358,10 +308,7 @@ bool clearPendingId(const String& expectedId) {
   return true;
 }
 
-String getPendingId() {
-  return nvs.getString("pending_id", "");
-}
-
+// Caching the SSID and channel lets the next wake skip the full scan.
 void saveWiFiInfo() {
   if (WiFi.status() == WL_CONNECTED) {
     nvs.putString("wifi_ssid", WiFi.SSID());
@@ -369,60 +316,57 @@ void saveWiFiInfo() {
   }
 }
 
-// ===================== Message Parsing ========================
+// ======================== Message parsing ======================
 
-bool extractJsonString(const char* json, const char* key, char* value, int maxLen) {
-  // Extracts value from JSON like: {"key":"value"}.
-  // This is intentionally simple because the command schema is fixed and tiny.
-  String keyPattern = "\"" + String(key) + "\":\"";
-  String jsonStr(json);
+// Extracts a value from flat JSON such as {"key":"value"}. Intentionally
+// minimal: the command schema is fixed and tiny, so a real parser would only
+// add code size and heap pressure.
+bool extractJsonString(const char* json, const char* key, char* out, size_t outSize) {
+  char pattern[32];
+  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
 
-  int start = jsonStr.indexOf(keyPattern);
-  if (start == -1) return false;
+  const char* start = strstr(json, pattern);
+  if (start == nullptr) {
+    return false;
+  }
+  start += strlen(pattern);
 
-  start += keyPattern.length();
-  int end = jsonStr.indexOf("\"", start);
-  if (end == -1) return false;
+  const char* end = strchr(start, '"');
+  if (end == nullptr) {
+    return false;
+  }
 
-  int len = end - start;
-  if (len >= maxLen) len = maxLen - 1;
+  size_t len = end - start;
+  if (len >= outSize) {
+    len = outSize - 1;
+  }
 
-  jsonStr.substring(start, start + len).toCharArray(value, len + 1);
+  memcpy(out, start, len);
+  out[len] = '\0';
   return true;
 }
 
-Message parseMessage(const byte* payload, unsigned int length) {
-  Message msg = {"", "", false};
-
-  if (length > 512) {
-    Serial.println("[MSG] Payload too large");
-    return msg;
-  }
-
-  char* buffer = (char*)malloc(length + 1);
-  if (!buffer) {
-    Serial.println("[MSG] ERROR: out of memory while parsing payload");
-    return msg;
-  }
-
-  memcpy(buffer, payload, length);
-  buffer[length] = '\0';
-
-  if (extractJsonString(buffer, "id", msg.id, sizeof(msg.id)) &&
-      extractJsonString(buffer, "command", msg.command, sizeof(msg.command))) {
-    msg.valid = true;
-  }
-
-  free(buffer);
-  return msg;
+// Fills msg from a NUL-terminated JSON payload. Returns false when a mandatory
+// field is missing.
+bool parseMessage(const char* json, Message& msg) {
+  return extractJsonString(json, "id", msg.id, sizeof(msg.id)) &&
+         extractJsonString(json, "command", msg.command, sizeof(msg.command));
 }
 
-// ===================== GPIO & Relay ===========================
+// ======================== Hardware actions =====================
+
+void initHardware() {
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  servo.attach(SERVO_PIN);
+  servo.write(SERVO_ANGLE_REST);
+}
 
 void pulseRelay() {
   Serial.println("[GPIO] Activating relay");
   digitalWrite(RELAY_PIN, HIGH);
-  delay(PULSE_MS);
+  delay(RELAY_PULSE_MS);
   digitalWrite(RELAY_PIN, LOW);
   Serial.println("[GPIO] Relay deactivated");
 }
@@ -430,22 +374,20 @@ void pulseRelay() {
 void oscillateServo() {
   Serial.println("[GPIO] Starting servo oscillation");
 
-  for (int cycle = 0; cycle < SERVO_CYCLES; cycle++) {
-    Serial.printf("[GPIO] Servo cycle %d/%d\r\n", cycle + 1, SERVO_CYCLES);
+  for (int cycle = 1; cycle <= SERVO_CYCLES; cycle++) {
+    Serial.printf("[GPIO] Servo cycle %d/%d\r\n", cycle, SERVO_CYCLES);
 
-    servo.write(SERVO_ANGLE);
-    Serial.printf("[GPIO] Servo moved to %d degrees\r\n", SERVO_ANGLE);
+    servo.write(SERVO_ANGLE_ACTIVE);
     delay(SERVO_MOVE_DELAY_MS);
 
-    servo.write(0);
-    Serial.println("[GPIO] Servo returned to 0 degrees");
+    servo.write(SERVO_ANGLE_REST);
     delay(SERVO_RETURN_DELAY_MS);
   }
 
   Serial.println("[GPIO] Servo oscillation complete");
 }
 
-// ===================== Time / TLS =============================
+// ========================== System time ========================
 
 bool syncSystemTime() {
   time_t now = time(nullptr);
@@ -474,9 +416,69 @@ bool syncSystemTime() {
   return false;
 }
 
-// ===================== MQTT ===================================
+// ========================== WiFi & TLS =========================
 
-const char* getMqttStateString(int state) {
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Already connected");
+    return;
+  }
+
+  String savedSsid = nvs.getString("wifi_ssid", "");
+  int savedChannel = nvs.getInt("wifi_channel", -1);
+
+  WiFi.mode(WIFI_STA);
+
+  if (!savedSsid.isEmpty() && savedChannel > 0) {
+    Serial.printf("[WiFi] Connecting to %s (cached channel %d)\r\n", savedSsid.c_str(), savedChannel);
+    WiFi.begin(savedSsid.c_str(), WIFI_PASSWORD, savedChannel);
+  } else if (WIFI_CHANNEL >= 0) {
+    Serial.printf("[WiFi] Connecting to %s (channel %d)\r\n", WIFI_SSID, WIFI_CHANNEL);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
+  } else {
+    Serial.printf("[WiFi] Connecting to %s\r\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\r\n[WiFi] Connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
+    saveWiFiInfo();
+  } else {
+    Serial.println("\r\n[WiFi] Connection timeout");
+  }
+}
+
+void setupTls() {
+  // MQTT: full certificate verification. Without a usable CA the sketch still
+  // connects, but over an encrypted-yet-unverified (MITM-able) channel.
+  if (strstr(MQTT_ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
+    tlsClient.setCACert(MQTT_ROOT_CA);
+  } else {
+    Serial.println("[TLS/MQTT] ERROR: MQTT_ROOT_CA is missing, falling back to an unverified connection");
+    tlsClient.setInsecure();
+  }
+  tlsClient.setTimeout(TLS_TIMEOUT_MS);
+
+  // Telegram: verification only, no insecure fallback. A missing CA simply means
+  // notifications stop working.
+  if (strstr(TELEGRAM_ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
+    telegramClient.setCACert(TELEGRAM_ROOT_CA);
+    Serial.println("[TLS/Telegram] Certificate verification enabled");
+  } else {
+    Serial.println("[TLS/Telegram] ERROR: TELEGRAM_ROOT_CA is missing, notifications will fail");
+  }
+  telegramClient.setTimeout(TLS_TIMEOUT_MS);
+}
+
+// ======================== MQTT connection ======================
+
+const char* mqttStateName(int state) {
   switch (state) {
     case -4: return "MQTT_CONNECT_FAILED";
     case -3: return "MQTT_CONNECTION_REFUSED";
@@ -492,27 +494,54 @@ const char* getMqttStateString(int state) {
   }
 }
 
-void onMqttMessage(char* topic, byte* payload, unsigned int length);
-void connectMqtt();
+void connectMqtt() {
+  for (int attempt = 1; attempt <= MQTT_CONNECT_ATTEMPTS && !mqtt.connected(); attempt++) {
+    Serial.printf("[MQTT] Connecting (attempt %d/%d)...\r\n", attempt, MQTT_CONNECT_ATTEMPTS);
 
-String formatNotification(const String& id, const String& result) {
-  if (result == "OK") {
-    return "🚪 OpenGate: gate opened\nCommand ID: " + id;
+    // MQTT 3.1.1 persistent session: cleanSession=false. This preserves the
+    // subscription and the queued QoS 1 messages while the ESP32 is asleep.
+    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD,
+                     nullptr, 0, false, nullptr, false)) {
+      Serial.println("[MQTT] Connected to broker (persistent session)");
+
+      // Re-subscribing on an existing persistent session is redundant but
+      // harmless, and it is required after the broker expires the session.
+      if (mqtt.subscribe(MQTT_CMD_TOPIC, 1)) {
+        Serial.printf("[MQTT] Subscribed to %s (QoS 1)\r\n", MQTT_CMD_TOPIC);
+      } else {
+        Serial.printf("[MQTT] ERROR: failed to subscribe to %s\r\n", MQTT_CMD_TOPIC);
+      }
+      return;
+    }
+
+    int rc = mqtt.state();
+    Serial.printf("[MQTT] Connection failed (state=%d, rc=%s)\r\n", rc, mqttStateName(rc));
+    if (attempt < MQTT_CONNECT_ATTEMPTS) {
+      delay(MQTT_RETRY_DELAY_MS);
+    }
   }
-  if (result == "DUPLICATE") {
-    return "⚠️ OpenGate: duplicate command ignored\nCommand ID: " + id;
+
+  if (!mqtt.connected()) {
+    Serial.println("[MQTT] ERROR: failed to connect after all retry attempts");
   }
-  if (result == "RECOVERED") {
-    return "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again\nCommand ID: " + id;
-  }
-  if (result == "NVS_ERROR") {
-    return "❌ OpenGate: NVS error, gate command NOT executed\nCommand ID: " + id;
-  }
-  if (result == "UNKNOWN_COMMAND") {
-    return "⚠️ OpenGate: unsupported command received\nCommand ID: " + id;
-  }
-  return "⚠️ OpenGate: command result = " + result + "\nCommand ID: " + id;
 }
+
+// ===================== Telegram notifications ==================
+
+struct ResultText {
+  const char* result;
+  const char* text;
+};
+
+// Telegram wording per ACK result. Results missing from this table fall back to
+// a generic message, so adding a result code never breaks the notification path.
+const ResultText RESULT_TEXTS[] = {
+  {"OK",              "🚪 OpenGate: gate opened"},
+  {"DUPLICATE",       "⚠️ OpenGate: duplicate command ignored"},
+  {"RECOVERED",       "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again"},
+  {"NVS_ERROR",       "❌ OpenGate: NVS error, gate command NOT executed"},
+  {"UNKNOWN_COMMAND", "⚠️ OpenGate: unsupported command received"},
+};
 
 void queueMessage(const String& message) {
   if (notificationCount >= MAX_QUEUED_NOTIFICATIONS) {
@@ -525,7 +554,13 @@ void queueMessage(const String& message) {
 }
 
 void queueNotification(const String& id, const String& result) {
-  queueMessage(formatNotification(id, result));
+  for (const ResultText& entry : RESULT_TEXTS) {
+    if (result == entry.result) {
+      queueMessage(String(entry.text) + "\nCommand ID: " + id);
+      return;
+    }
+  }
+  queueMessage("⚠️ OpenGate: command result = " + result + "\nCommand ID: " + id);
 }
 
 // Sends every queued notification. Call this only after mqtt.disconnect(), so
@@ -543,8 +578,7 @@ void flushNotifications() {
   }
 
   for (int i = 0; i < notificationCount; i++) {
-    bool sent = telegramBot.sendMessage(TELEGRAM_CHAT_ID, notificationQueue[i], "");
-    if (sent) {
+    if (telegramBot.sendMessage(TELEGRAM_CHAT_ID, notificationQueue[i], "")) {
       Serial.println("[Telegram] Notification sent");
     } else {
       Serial.println("[Telegram] Failed to send notification");
@@ -553,6 +587,8 @@ void flushNotifications() {
 
   notificationCount = 0;
 }
+
+// =========================== MQTT ACK ==========================
 
 // Publishes a single ACK message. Returns false when MQTT is unavailable or the
 // socket write fails.
@@ -563,21 +599,17 @@ bool publishAckPayload(const String& id, const String& result) {
   }
 
   time_t now = time(nullptr);
-  struct tm* timeinfo = gmtime(&now);
   char timestamp[30];
-  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
 
   char payload[256];
   snprintf(payload, sizeof(payload),
            "{\"id\":\"%s\",\"result\":\"%s\",\"timestamp\":\"%s\"}",
            id.c_str(), result.c_str(), timestamp);
 
-  // PubSubClient publish(topic, payload, length, retain): the library does
-  // not provide QoS 1 publishing through this overload. For this ACK we keep
-  // retain=false. The command itself is what uses QoS 1/persistent delivery.
-  //
-  // IMPORTANT: do not claim this ACK is QoS 1 if PubSubClient is configured
-  // only for QoS 0 publishing.
+  // PubSubClient's publish(topic, payload, retain) overload is QoS 0 only; the
+  // library offers no QoS 1 publishing. Only the command direction relies on
+  // QoS 1 / persistent delivery, so do not document this ACK as QoS 1.
   bool ok = mqtt.publish(MQTT_ACK_TOPIC, payload, false);
 
   if (ok) {
@@ -594,10 +626,10 @@ bool publishAckPayload(const String& id, const String& result) {
 bool publishAck(const String& id, const String& result, bool notify = true) {
   bool mqttOk = publishAckPayload(id, result);
 
-  // A hardware action blocks for seconds, which is long enough for the broker
-  // to drop the socket. Reconnect once per wake so the outcome still reaches
-  // the publisher. Re-subscribing is harmless here: nothing calls mqtt.loop()
-  // after this point, so anything still queued stays queued for the next wake.
+  // A hardware action blocks for seconds, which is long enough for the broker to
+  // drop the socket. Reconnect once per wake so the outcome still reaches the
+  // publisher. Re-subscribing is harmless here: nothing calls mqtt.loop() after
+  // this point, so anything still queued stays queued for the next wake.
   if (!mqttOk && !mqttReconnectAttempted && WiFi.status() == WL_CONNECTED) {
     mqttReconnectAttempted = true;
     Serial.println("[ACK] Publish failed; reconnecting once to retry");
@@ -613,28 +645,29 @@ bool publishAck(const String& id, const String& result, bool notify = true) {
   return mqttOk;
 }
 
-// MQTT message callback.
-//
+// ======================== MQTT callback ========================
+
 // Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
 // only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Commands
-// are therefore only parsed and appended to collectedCommands here;
-// processCollectedCommands() does the actual work once we are back in setup().
+// are therefore only parsed and buffered here; processCollectedCommands() does
+// the actual work once we are back in setup().
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
-
   messageReceived = true;
 
-  char rawPayload[512];
-  if (length >= sizeof(rawPayload)) {
-    Serial.println("[MQTT] Payload too large to log");
-  } else {
-    memcpy(rawPayload, payload, length);
-    rawPayload[length] = '\0';
-    Serial.printf("[MQTT] Raw payload: %s\r\n", rawPayload);
+  Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
+
+  if (length >= MQTT_MAX_PAYLOAD_LEN) {
+    Serial.printf("[MQTT] Payload too large (%u bytes), ignored\r\n", length);
+    return;
   }
 
-  Message msg = parseMessage(payload, length);
-  if (!msg.valid) {
+  char json[MQTT_MAX_PAYLOAD_LEN];
+  memcpy(json, payload, length);
+  json[length] = '\0';
+  Serial.printf("[MQTT] Raw payload: %s\r\n", json);
+
+  Message msg;
+  if (!parseMessage(json, msg)) {
     Serial.println("[MSG] Missing id or command field");
     return;
   }
@@ -651,15 +684,15 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   collectedCount++;
 }
 
-// ===================== Command dispatch =======================
+// ======================== Command dispatch =====================
 //
-// To add a new command, write a handler returning true on success and append an
-// entry to COMMAND_TABLE. Nothing else needs to change: collection, parsing,
-// deduplication, ACK and Telegram notification are already generic.
+// To add a command, write a handler returning true on success and append an
+// entry to COMMAND_TABLE. Collection, parsing, deduplication, ACK and Telegram
+// notification are already generic.
 //
 // requiresReservation marks commands with an irreversible physical effect. Those
 // go through the NVS PENDING reservation, which guarantees at-most-once
-// execution across a reset (see the file header), and only the first one of a
+// execution across a reset (see DESIGN NOTE 1), and only the first one of a
 // batch is executed. Read-only or idempotent commands should set it to false:
 // they are cheap to repeat, skip the two extra flash writes, and every one of
 // them collected during a wake is executed.
@@ -674,12 +707,10 @@ const CommandDefinition COMMAND_TABLE[] = {
   {"OPEN", handleOpen, true},
 };
 
-const int COMMAND_COUNT = sizeof(COMMAND_TABLE) / sizeof(COMMAND_TABLE[0]);
-
-const CommandDefinition* findCommand(const String& name) {
-  for (int i = 0; i < COMMAND_COUNT; i++) {
-    if (name == COMMAND_TABLE[i].name) {
-      return &COMMAND_TABLE[i];
+const CommandDefinition* findCommand(const char* name) {
+  for (const CommandDefinition& definition : COMMAND_TABLE) {
+    if (strcmp(name, definition.name) == 0) {
+      return &definition;
     }
   }
   return nullptr;
@@ -689,72 +720,47 @@ const CommandDefinition* findCommand(const String& name) {
 // callback, and after the collection phase, so that the PUBACK for every queued
 // command has already left the device before the slow work starts.
 void executeCommand(const Message& message, const CommandDefinition* definition) {
-  String id(message.id);
-  String command(message.command);
+  const String id(message.id);
+  const bool reserved = definition->requiresReservation;
 
-  // Commands with no irreversible effect run directly: re-executing them after
-  // a reset is harmless, so they need no PENDING reservation.
-  if (!definition->requiresReservation) {
-    Serial.printf("[CMD] Executing %s id=%s\r\n", command.c_str(), id.c_str());
-    bool ok = definition->handler();
-
-    if (!saveProcessedId(id)) {
-      Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
-    }
-
-    publishAck(id, ok ? "OK" : "FAILED");
-    return;
-  }
-
-  // -----------------------------------------------------------------
-  // Transactional hardware execution:
-  // reserve the command in NVS BEFORE running the handler.
-  // -----------------------------------------------------------------
-  if (!reservePendingId(id)) {
+  // Transactional hardware execution: reserve the command in NVS BEFORE running
+  // the handler, so a reset mid-action cannot lead to a second execution.
+  if (reserved && !reservePendingId(id)) {
     Serial.printf("[CMD] Refusing %s because PENDING reservation failed: %s\r\n",
-                  command.c_str(), id.c_str());
+                  message.command, id.c_str());
     publishAck(id, "NVS_ERROR");
     return;
   }
 
-  Serial.printf("[CMD] Executing %s id=%s\r\n", command.c_str(), id.c_str());
-  bool ok = definition->handler();
+  Serial.printf("[CMD] Executing %s id=%s\r\n", message.command, id.c_str());
+  const bool ok = definition->handler();
 
   // Persist completion before acknowledging. This runs even when the handler
   // reported a failure: the hardware may have moved anyway, and at-most-once
   // forbids a second attempt.
   if (!saveProcessedId(id)) {
-    // Keep pending_id in NVS. On the next boot the command will be treated as
-    // already-triggered and the handler will NOT run again.
-    Serial.println("[CMD] WARNING: command executed but could not be committed to processed-ID list");
-    publishAck(id, "EXECUTED_NVS_ERROR");
+    // pending_id is deliberately left in NVS: on the next boot the command is
+    // treated as already-triggered and the handler will NOT run again.
+    Serial.println("[CMD] WARNING: command executed but could not be committed to the processed-ID list");
+    publishAck(id, reserved ? "EXECUTED_NVS_ERROR" : (ok ? "OK" : "FAILED"));
     return;
   }
 
-  // Once processed-ID is durable, the pending reservation can be removed.
-  if (!clearPendingId(id)) {
-    // processed-ID already protects against a second execution, so this is safe.
+  // Once the processed ID is durable, the pending reservation can be removed.
+  if (reserved && !clearPendingId(id)) {
+    // The processed ID already protects against a second execution, so this is safe.
     Serial.println("[CMD] WARNING: processed ID saved but PENDING flag could not be cleared");
   }
 
   publishAck(id, ok ? "OK" : "FAILED");
 }
 
-// True when the same command ID already appears earlier in the collected batch,
-// which happens when the broker re-delivers a message whose PUBACK was lost.
-bool isRepeatedInBatch(int index, const String& id) {
-  for (int i = 0; i < index; i++) {
-    if (id == collectedCommands[i].id) {
-      return true;
-    }
-  }
-  return false;
-}
+// ========================== Wake phases ========================
 
-// Phase 1: read every command the broker has queued for us. PubSubClient
-// PUBACKs each message as soon as the callback returns, so after this function
-// the broker considers the queue delivered and will not repeat it at the next
-// wake. Nothing is executed here — commands are only buffered.
+// Phase 1: read every command the broker has queued for us. PubSubClient PUBACKs
+// each message as soon as the callback returns, so after this function the broker
+// considers the queue delivered and will not repeat it at the next wake. Nothing
+// is executed here — commands are only buffered.
 void collectQueuedCommands() {
   Serial.printf("[MQTT] Collecting queued commands (idle timeout=%lu ms)\r\n", MQTT_COLLECT_IDLE_MS);
 
@@ -770,8 +776,8 @@ void collectQueuedCommands() {
     messageReceived = false;
     mqtt.loop();
 
-    // Bytes already decrypted and waiting: another packet is on its way, so keep
-    // reading without burning the grace period.
+    // Bytes already decrypted and waiting mean another packet is on its way, so
+    // keep reading without burning the grace period.
     if (messageReceived || tlsClient.available() > 0) {
       lastActivity = millis();
       continue;
@@ -792,69 +798,78 @@ void collectQueuedCommands() {
                 millis() - start, collectedCount, droppedCount);
 }
 
+// True when the same command ID already appears earlier in the collected batch,
+// which happens when the broker re-delivers a message whose PUBACK was lost.
+bool isRepeatedInBatch(int index, const char* id) {
+  for (int i = 0; i < index; i++) {
+    if (strcmp(id, collectedCommands[i].id) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// What pass 1 of processCollectedCommands() decided for one collected command.
+struct CommandPlan {
+  const CommandDefinition* definition; // nullptr => the command will not run
+  const char* result;                  // ACK result when definition == nullptr
+  bool persistId;                      // add the ID to the processed-ID list
+};
+
 // Phase 2: classify the collected commands and run at most one irreversible
-// action — the first that arrived. Everything that will not run is
-// acknowledged first, while the socket is still fresh, because the hardware
-// action afterwards blocks for seconds and may outlive the connection.
+// action — the first that arrived. Everything that will not run is acknowledged
+// first, while the socket is still fresh, because the hardware action afterwards
+// blocks for seconds and may outlive the connection.
 void processCollectedCommands() {
   if (collectedCount == 0 && droppedCount == 0) {
     Serial.println("[MSG] No command received");
     return;
   }
 
-  // ---- Pass 1: decide, without touching the hardware or the flash. ----
-  // plan[i] == nullptr means "not executed"; results[i] is then its ACK result.
-  const CommandDefinition* plan[MAX_COLLECTED_COMMANDS];
-  String results[MAX_COLLECTED_COMMANDS];
-  bool persist[MAX_COLLECTED_COMMANDS];
-
+  CommandPlan plans[MAX_COLLECTED_COMMANDS] = {};
   bool actionSelected = false;
   int duplicates = 0;
   int unsupported = 0;
 
+  // ---- Pass 1: decide, without touching the hardware or the flash. ----
   for (int i = 0; i < collectedCount; i++) {
-    String id(collectedCommands[i].id);
-    String command(collectedCommands[i].command);
-
-    plan[i] = nullptr;
-    persist[i] = false;
-
-    Serial.printf("[MSG] id=%s, command=%s\r\n", id.c_str(), command.c_str());
+    const Message& msg = collectedCommands[i];
+    Serial.printf("[MSG] id=%s, command=%s\r\n", msg.id, msg.command);
 
     // Already handled in an earlier wake, or the very same ID delivered twice.
     // Either way its ID is already on record, so nothing needs persisting.
-    if (isRepeatedInBatch(i, id) || hasProcessedId(id)) {
-      Serial.printf("[CMD] DUPLICATE id=%s\r\n", id.c_str());
-      results[i] = "DUPLICATE";
+    if (isRepeatedInBatch(i, msg.id) || hasProcessedId(msg.id)) {
+      Serial.printf("[CMD] DUPLICATE id=%s\r\n", msg.id);
+      plans[i].result = "DUPLICATE";
       duplicates++;
       continue;
     }
 
-    const CommandDefinition* definition = findCommand(command);
+    const CommandDefinition* definition = findCommand(msg.command);
     if (definition == nullptr) {
-      Serial.printf("[CMD] Unsupported command: %s\r\n", command.c_str());
-      results[i] = "UNKNOWN_COMMAND";
-      persist[i] = true;
+      Serial.printf("[CMD] Unsupported command: %s\r\n", msg.command);
+      plans[i].result = "UNKNOWN_COMMAND";
+      plans[i].persistId = true;
       unsupported++;
       continue;
     }
 
-    // Only the first irreversible command of the batch runs. A burst of OPENs
-    // means the button was pressed repeatedly, not that the gate must cycle
-    // once per press, so the rest count as duplicates.
-    if (definition->requiresReservation && actionSelected) {
-      Serial.printf("[CMD] An action is already scheduled for this wake, treating as duplicate: id=%s\r\n",
-                    id.c_str());
-      results[i] = "DUPLICATE";
-      persist[i] = true;
-      duplicates++;
-      continue;
-    }
-
     if (definition->requiresReservation) {
+      // Only the first irreversible command of the batch runs. A burst of OPENs
+      // means the button was pressed repeatedly, not that the gate must cycle
+      // once per press, so the rest count as duplicates.
+      if (actionSelected) {
+        Serial.printf("[CMD] An action is already scheduled for this wake, treating as duplicate: id=%s\r\n",
+                      msg.id);
+        plans[i].result = "DUPLICATE";
+        plans[i].persistId = true;
+        duplicates++;
+        continue;
+      }
       actionSelected = true;
     }
-    plan[i] = definition;
+
+    plans[i].definition = definition;
   }
 
   // ---- Pass 2: commit and acknowledge everything that will not run. ----
@@ -864,8 +879,8 @@ void processCollectedCommands() {
   String skippedIds[MAX_COLLECTED_COMMANDS];
   int skippedCount = 0;
   for (int i = 0; i < collectedCount; i++) {
-    if (plan[i] == nullptr && persist[i]) {
-      skippedIds[skippedCount] = String(collectedCommands[i].id);
+    if (plans[i].definition == nullptr && plans[i].persistId) {
+      skippedIds[skippedCount] = collectedCommands[i].id;
       skippedCount++;
     }
   }
@@ -874,18 +889,18 @@ void processCollectedCommands() {
     Serial.println("[CMD] WARNING: skipped commands could not be added to the processed-ID list");
   }
 
-  // MQTT ACK only: the publisher still learns the outcome, but a burst of
-  // button presses does not become a burst of Telegram messages.
+  // MQTT ACK only: the publisher still learns the outcome, but a burst of button
+  // presses does not become a burst of Telegram messages.
   for (int i = 0; i < collectedCount; i++) {
-    if (plan[i] == nullptr) {
-      publishAck(String(collectedCommands[i].id), results[i], false);
+    if (plans[i].definition == nullptr) {
+      publishAck(collectedCommands[i].id, plans[i].result, false);
     }
   }
 
   // ---- Pass 3: execute. ----
   for (int i = 0; i < collectedCount; i++) {
-    if (plan[i] != nullptr) {
-      executeCommand(collectedCommands[i], plan[i]);
+    if (plans[i].definition != nullptr) {
+      executeCommand(collectedCommands[i], plans[i].definition);
     }
   }
 
@@ -905,105 +920,8 @@ void processCollectedCommands() {
   }
 }
 
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[WiFi] Already connected");
-    return;
-  }
-
-  String savedSsid = nvs.getString("wifi_ssid", "");
-  int savedChannel = nvs.getInt("wifi_channel", -1);
-
-  WiFi.mode(WIFI_STA);
-
-  if (savedSsid.length() > 0 && savedChannel > 0) {
-    Serial.printf("[WiFi] Connecting to %s (cached channel %d)\r\n", savedSsid.c_str(), savedChannel);
-    WiFi.begin(savedSsid.c_str(), WIFI_PASSWORD, savedChannel);
-  } else {
-    Serial.printf("[WiFi] Connecting to %s\r\n", WIFI_SSID);
-    if (WIFI_CHANNEL >= 0) {
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
-    } else {
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-  }
-
-  unsigned long timeout = millis() + 10000;
-  while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\r\n[WiFi] Connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
-    saveWiFiInfo();
-  } else {
-    Serial.println("\r\n[WiFi] Connection timeout");
-  }
-}
-
-void setupTls() {
-  // MQTT TLS: full certificate verification using the CA configured in secrets.h.
-  if (strstr(ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
-    tlsClient.setCACert(ROOT_CA);
-  } else {
-    Serial.println("[TLS/MQTT] ERROR: ROOT_CA is missing");
-    tlsClient.setInsecure();
-  }
-  tlsClient.setTimeout(5000);
-
-  // Telegram TLS: certificate verification using the GoDaddy Root G2 CA.
-  // api.telegram.org is currently served with a GoDaddy-issued certificate,
-  // and GoDaddy publishes this root certificate in its official repository.
-  if (strstr(TELEGRAM_ROOT_CA, "BEGIN CERTIFICATE") != nullptr) {
-    telegramClient.setCACert(TELEGRAM_ROOT_CA);
-    Serial.println("[TLS/Telegram] Certificate verification enabled");
-  } else {
-    Serial.println("[TLS/Telegram] ERROR: TELEGRAM_ROOT_CA is missing");
-  }
-  telegramClient.setTimeout(5000);
-}
-
-void connectMqtt() {
-  int attempts = 0;
-  const int MAX_ATTEMPTS = 3;
-
-  while (!mqtt.connected() && attempts < MAX_ATTEMPTS) {
-    Serial.printf("[MQTT] Connecting (attempt %d/%d)...\r\n", attempts + 1, MAX_ATTEMPTS);
-
-    // MQTT 3.1.1 persistent session: cleanSession=false.
-    // This preserves the subscription and queued QoS 1 messages while the
-    // ESP32 is disconnected/deep sleeping.
-    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD,
-                     nullptr, 0, false, nullptr, false)) {
-      Serial.println("[MQTT] Connected to broker (persistent session)");
-
-      // Re-subscribing on an existing persistent session is redundant but
-      // harmless, and it is required after the broker expires the session.
-      if (mqtt.subscribe(MQTT_CMD_TOPIC, 1)) {
-        Serial.printf("[MQTT] Successfully subscribed to %s (QoS 1)\r\n", MQTT_CMD_TOPIC);
-      } else {
-        Serial.printf("[MQTT] ERROR: Failed to subscribe to %s\r\n", MQTT_CMD_TOPIC);
-      }
-
-      return;
-    }
-
-    int rc = mqtt.state();
-    Serial.printf("[MQTT] Connection failed (state=%d, rc=%s)\r\n", rc, getMqttStateString(rc));
-    attempts++;
-    if (attempts < MAX_ATTEMPTS) {
-      delay(1000);
-    }
-  }
-
-  if (!mqtt.connected()) {
-    Serial.println("[MQTT] ERROR: Failed to connect after all retry attempts");
-  }
-}
-
-// ===================== Pending recovery =======================
-
+// Runs before phase 1, so a hardware transaction interrupted by a reset can
+// never be executed a second time by a command that arrives now.
 void recoverPendingCommand() {
   String pendingId = getPendingId();
   if (pendingId.isEmpty()) {
@@ -1012,8 +930,9 @@ void recoverPendingCommand() {
 
   Serial.printf("[RECOVERY] Found pending command after reset: %s\r\n", pendingId.c_str());
 
-  // If it is already in processed_ids, the previous boot completed the hardware
-  // action and persisted completion; only the final cleanup may have been interrupted.
+  // If it is already in the processed-ID list, the previous boot completed the
+  // hardware action and persisted completion; only the final cleanup was
+  // interrupted.
   if (hasProcessedId(pendingId)) {
     Serial.println("[RECOVERY] Command already committed as PROCESSED; clearing stale PENDING flag");
     clearPendingId(pendingId);
@@ -1021,18 +940,12 @@ void recoverPendingCommand() {
   }
 
   // We cannot know whether the relay pulse completed before the reset. To prevent
-  // a second gate opening, never execute the relay again. Instead report the state.
+  // a second gate opening, never run the handler again — just report the state.
   Serial.println("[RECOVERY] Command execution state is uncertain; relay will NOT be triggered again");
 
-  // Try MQTT ACK first. If MQTT is unavailable, leave PENDING in NVS and retry recovery
-  // after the next boot.
-  if (!mqtt.connected()) {
-    Serial.println("[RECOVERY] MQTT not connected; keeping PENDING command");
-    return;
-  }
-
-  bool ackOk = publishAck(pendingId, "RECOVERED");
-  if (!ackOk) {
+  // If the outcome cannot be reported, leave PENDING in NVS and retry recovery
+  // at the next boot.
+  if (!publishAck(pendingId, "RECOVERED")) {
     Serial.println("[RECOVERY] MQTT ACK failed; keeping PENDING command for next boot");
     return;
   }
@@ -1041,69 +954,69 @@ void recoverPendingCommand() {
     clearPendingId(pendingId);
     Serial.println("[RECOVERY] Pending command marked PROCESSED without re-triggering relay");
   } else {
-    Serial.println("[RECOVERY] WARNING: ACK sent but processed-ID could not be saved; keeping PENDING flag");
+    Serial.println("[RECOVERY] WARNING: ACK sent but processed ID could not be saved; keeping PENDING flag");
   }
 }
 
-// ===================== Setup & Loop ============================
+// ========================= Setup & loop ========================
+
+void enterDeepSleep() {
+  Serial.printf("\r\n[Sleep] Going to deep sleep for %u s...\r\n", DEEP_SLEEP_SECONDS);
+  Serial.flush();
+  esp_deep_sleep(DEEP_SLEEP_DURATION_US);
+}
+
+// The whole MQTT part of a wake, from recovery to disconnection.
+void runWakeCycle() {
+  recoverPendingCommand();
+
+  // Phase 1: read and acknowledge everything the broker has queued, so the next
+  // wake starts from an empty queue.
+  collectQueuedCommands();
+
+  // Phase 2: decide and execute. mqtt.loop() is never called again from here on,
+  // so no new message can arrive while the hardware is busy.
+  processCollectedCommands();
+
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+    Serial.println("[MQTT] Disconnected");
+  }
+}
 
 void setup() {
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  initHardware();
 
-  servo.attach(SERVO_PIN);
-  servo.write(0);
-
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
   delay(100);
-
   Serial.println("\r\n================== ESP32 WAKE UP ==================");
 
   if (!nvsInit()) {
     Serial.println("[Init] NVS initialization failed; entering deep sleep");
-    esp_deep_sleep(DEEP_SLEEP_DURATION_US);
+    enterDeepSleep();
   }
 
-  // Generate stable client ID from MAC.
+  // Stable client ID derived from the MAC, so the broker recognises the same
+  // persistent session at every wake.
   clientId = "opengate-esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   Serial.printf("[Init] Client ID: %s\r\n", clientId.c_str());
 
   connectWiFi();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    bool timeValid = syncSystemTime();
-    if (!timeValid) {
-      Serial.println("[Init] WARNING: system time is not valid; certificate verification may fail");
-    }
+  if (WiFi.status() == WL_CONNECTED && !syncSystemTime()) {
+    Serial.println("[Init] WARNING: system time is not valid; certificate verification may fail");
   }
 
   setupTls();
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
-  mqtt.setKeepAlive(30);
-
+  mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
   connectMqtt();
 
-  if (!mqtt.connected()) {
-    Serial.println("[MQTT] ERROR: Not connected to MQTT broker, skipping this wake");
+  if (mqtt.connected()) {
+    runWakeCycle();
   } else {
-    // Recover a hardware transaction interrupted by a reset before listening for
-    // new messages, so the pending command cannot be executed a second time.
-    recoverPendingCommand();
-
-    // Phase 1: read and acknowledge everything the broker has queued, so the
-    // next wake starts from an empty queue.
-    collectQueuedCommands();
-
-    // Phase 2: decide and execute. mqtt.loop() is never called again from here
-    // on, so no new message can arrive while the hardware is busy.
-    processCollectedCommands();
-
-    if (mqtt.connected()) {
-      mqtt.disconnect();
-      Serial.println("[MQTT] Disconnected");
-    }
+    Serial.println("[MQTT] ERROR: not connected to the broker, skipping this wake");
   }
 
   // Only now, with the MQTT TLS context freed by disconnect(), is there enough
@@ -1111,13 +1024,9 @@ void setup() {
   flushNotifications();
 
   nvs.end();
-
-  Serial.printf("\r\n[Sleep] Going to deep sleep for 2 minutes...\r\n");
-  Serial.flush();
-
-  esp_deep_sleep(DEEP_SLEEP_DURATION_US);
+  enterDeepSleep();
 }
 
 void loop() {
-  // Never reached due to deep sleep.
+  // Never reached: setup() always ends in deep sleep.
 }
