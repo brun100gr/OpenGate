@@ -2,7 +2,8 @@
 
 IoT gate opener: a button in an Android app (phone **and** Android Auto)
 publishes an MQTT message to a cloud broker; an ESP32 subscribed to the same
-topic closes a relay wired to the gate control board.
+topic closes a relay wired to the gate control board. The same press also
+starts streaming the phone position to the broker for five minutes.
 
 ```
 Phone / Android Auto ──(MQTT/TLS, mobile network)──► HiveMQ Cloud ──(MQTT/TLS, WiFi)──► ESP32 ──► relay ──► gate control board
@@ -64,6 +65,10 @@ before deploying to production.
    If the free plan does not allow granular permissions, that's fine: still
    use two distinct users with strong passwords.
 
+   If you *did* restrict permissions per topic, remember to allow
+   `opengate-app` to publish on `opengate/gps` as well, not just on
+   `opengate/cmd` — otherwise the position stream is rejected silently.
+
 ## 2. Android App
 
 You need [Android Studio](https://developer.android.com/studio) (it downloads
@@ -80,6 +85,30 @@ the proper SDK and JDK on its own).
 3. Connect the phone via USB (with **USB debugging** enabled in developer
    options) and press **Run ▶**. The app appears on the phone: a single
    "Open gate" button.
+
+### GPS Position Streaming
+
+Pressing "Open gate" does two independent things: it publishes the `OPEN`
+command, and it starts a five-minute tracking session that publishes the phone
+position to `opengate/gps` once a second, with **QoS 0** — a lost fix is simply
+replaced by the next one a second later. Pressing the button again during a
+session restarts the five minutes without reconnecting.
+
+The tracking runs in a foreground service, so it keeps going with the screen
+off or the app in the background — which is the whole point, since the phone is
+normally in a car mount. While it is active a silent, persistent notification
+is shown; Android requires it and it doubles as the way to tell the stream is
+running. The session ends on its own after five minutes and the notification
+disappears.
+
+The first press asks for the **location** permission (and, on Android 13+, for
+the notification permission). Both are optional: if you refuse, the gate still
+opens and only the position stream is skipped. On Android Auto no dialog is
+ever shown — grant the permission once from the phone UI, otherwise the car
+screen just reports that no position was sent.
+
+The payload format is documented in [MQTT_DEBUG.md](MQTT_DEBUG.md), which also
+shows how to watch the stream with `mosquitto_sub`.
 
 ### Enabling the App on Android Auto (without the Play Store)
 
@@ -218,7 +247,10 @@ The phone and DHU should auto-connect; you'll see the OpenGate grid with the "Op
 2. From the phone app press **Open gate** → the app shows "Command sent ✓",
    the serial monitor prints "Valid command: opening the gate", and the
    relay clicks for one second.
-3. Repeat from Android Auto (or from the DHU).
+3. Subscribe to `opengate/gps` (see [MQTT_DEBUG.md](MQTT_DEBUG.md)) and press
+   the button again: one position per second arrives for five minutes, then
+   the stream stops by itself.
+4. Repeat from Android Auto (or from the DHU).
 
 For debugging you can also publish manually from a PC with the Mosquitto
 clients:
@@ -235,10 +267,14 @@ This command opens your home, so:
 
 - **Already included**: TLS on both legs, authentication with separate
   credentials for the app and the ESP32, messages never `retained` (an
-  "open" command must not linger on the broker), QoS 1.
+  "open" command must not linger on the broker), QoS 1 on the command
+  (QoS 0 on the position stream, where a lost message costs nothing).
 - **To do manually**: paste the root CA into the sketch (see above) to
   prevent MITM on the ESP32 side.
 - **Known limitation**: anyone who obtains the app credentials can open the
   gate; the credentials are compiled into the APK, so do not share the APK.
   Possible evolution: signed payload with a timestamp (HMAC) to prevent
   replay even if the broker is compromised.
+- **Privacy**: `opengate/gps` carries your real position. The same credentials
+  that open the gate can subscribe to it, so losing the APK also means leaking
+  five minutes of your movements around home each time the gate is opened.

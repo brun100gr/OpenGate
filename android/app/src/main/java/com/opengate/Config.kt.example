@@ -33,7 +33,9 @@ object Config {
     val PASSWORD: String
         get() = if (IS_TEST) PASSWORD_TEST else PASSWORD_PROD
 
-    /** Topic and payload the ESP32 expects. */
-    const val TOPIC = "opengate/cmd"
-    const val COMMAND = "open"
+    /** MQTT topics and message format. */
+    const val CMD_TOPIC = "opengate/cmd"
+    const val ACK_TOPIC = "opengate/ack"
+    const val GPS_TOPIC = "opengate/gps"
+    const val COMMAND = "OPEN"  // Command name in the JSON payload
 }

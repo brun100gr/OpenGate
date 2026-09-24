@@ -12,6 +12,7 @@ import androidx.car.app.model.GridTemplate
 import androidx.car.app.model.ItemList
 import androidx.car.app.model.Template
 import androidx.core.graphics.drawable.IconCompat
+import com.opengate.GpsTrackingService
 import com.opengate.MqttPublisher
 import com.opengate.R
 
@@ -68,6 +69,17 @@ class GateScreen(carContext: CarContext) : Screen(carContext) {
                     CarToast.LENGTH_SHORT
                 ).show()
             }
+        }
+
+        // Permission dialogs have no place on a car screen: the location
+        // permission is granted once from the phone UI. Without it the gate
+        // still opens, only the position stream is skipped.
+        if (!GpsTrackingService.start(carContext)) {
+            CarToast.makeText(
+                carContext,
+                carContext.getString(R.string.gps_unavailable_short),
+                CarToast.LENGTH_SHORT
+            ).show()
         }
     }
 }

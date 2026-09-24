@@ -4,6 +4,15 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- GPS tracking started by the "Open gate" button. FINE is the one we
+         actually need; COARSE must be requested alongside it since API 31.
+         The foreground service keeps the stream alive with the screen off. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:icon="@drawable/ic_gate"
@@ -37,6 +46,13 @@
                 <category android:name="androidx.car.app.category.IOT" />
             </intent-filter>
         </service>
+
+        <!-- Publishes the GPS position for a few minutes after the gate is
+             opened; foreground so Android does not throttle the updates -->
+        <service
+            android:name=".GpsTrackingService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
 
     </application>
 </manifest>

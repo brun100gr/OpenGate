@@ -22,6 +22,9 @@ android {
     }
 
     compileOptions {
+        // Backports java.time (API 26+) down to minSdk: without it the
+        // timestamps in the MQTT payloads crash on Android 6.0–7.1
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -38,4 +41,8 @@ dependencies {
     // Eclipse Paho Java MQTT client, used directly (without the deprecated
     // Android service): more than enough for a simple publish
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+    // Fused location provider: GPS/network/sensor fusion, used to stream the
+    // position after the gate is opened
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }

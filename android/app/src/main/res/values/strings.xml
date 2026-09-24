@@ -7,4 +7,12 @@
     <string name="sent_ok">Command sent ✓</string>
     <string name="sent_error">Error: %1$s</string>
     <string name="sent_error_short">Send failed</string>
+
+    <!-- GPS tracking started by the button -->
+    <string name="gps_channel_name">Gate GPS tracking</string>
+    <string name="gps_notification_title">OpenGate</string>
+    <string name="gps_notification_text">Sending your position for 5 minutes</string>
+    <string name="gps_permission_denied">Location permission denied: position not sent</string>
+    <string name="gps_unavailable">Position not sent</string>
+    <string name="gps_unavailable_short">No position sent</string>
 </resources>

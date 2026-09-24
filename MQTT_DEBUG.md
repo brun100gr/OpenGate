@@ -7,8 +7,10 @@ Documentation of `mosquitto_pub` and `mosquitto_sub` commands to emulate ESP32 a
 - **Broker**: configured in `secrets.h`
 - **Command topic**: `opengate/cmd` (QoS 1, persistent session)
 - **ACK topic**: `opengate/ack` (QoS 0)
+- **GPS topic**: `opengate/gps` (QoS 0, published by the Android app only)
 - **Command format**: `{"id":"<uuid>","command":"<command-name>"}`
 - **ACK format**: `{"id":"<uuid>","result":"<result-code>","timestamp":"<iso-timestamp>"}`
+- **GPS format**: `{"id":"<session-uuid>","seq":<n>,"lat":<deg>,"lon":<deg>,"accuracy":<m>,"speed":<m/s>,"timestamp":"<iso-timestamp>"}`
 
 ## Supported Commands
 
@@ -125,6 +127,31 @@ mosquitto_sub \
   -P <password> \
   -t opengate/ack
 ```
+
+### Watch the GPS Stream
+
+After the "Open gate" button is pressed, the app publishes its position once a
+second for five minutes. Nothing answers on this topic: it is a one-way stream.
+
+```bash
+mosquitto_sub \
+  -h <region>.hivemq.cloud \
+  -p 8883 \
+  -u <username> \
+  -P <password> \
+  -t opengate/gps
+```
+
+Expected output, one line per second:
+
+```json
+{"id":"7f3c...","seq":0,"lat":45.123456,"lon":9.123456,"accuracy":8.5,"speed":12.3,"timestamp":"2026-09-22T12:00:00.123Z"}
+{"id":"7f3c...","seq":1,"lat":45.123461,"lon":9.123470,"accuracy":8.5,"speed":12.4,"timestamp":"2026-09-22T12:00:01.124Z"}
+```
+
+`id` identifies the tracking session, `seq` increments on every publish attempt:
+gaps in `seq` are messages lost on the way, which QoS 0 allows by design.
+`accuracy` and `speed` only appear when the fix provides them.
 
 ---
 
