@@ -7,7 +7,8 @@ Documentation of `mosquitto_pub` and `mosquitto_sub` commands to emulate ESP32 a
 - **Broker**: configured in `secrets.h`
 - **Command topic**: `opengate/cmd` (QoS 1, persistent session)
 - **ACK topic**: `opengate/ack` (QoS 0)
-- **GPS topic**: `opengate/gps` (QoS 0, published by the Android app only)
+- **GPS topic**: `opengate/gps` (QoS 0, published by the Android app, read by the
+  ESP32 only while a proximity window is open)
 - **Command format**: `{"id":"<uuid>","command":"<command-name>"}`
 - **ACK format**: `{"id":"<uuid>","result":"<result-code>","timestamp":"<iso-timestamp>"}`
 - **GPS format**: `{"id":"<session-uuid>","seq":<n>,"lat":<deg>,"lon":<deg>,"accuracy":<m>,"speed":<m/s>,"timestamp":"<iso-timestamp>"}`
@@ -16,7 +17,23 @@ Documentation of `mosquitto_pub` and `mosquitto_sub` commands to emulate ESP32 a
 
 | Command | Description | Result Codes |
 |---------|-------------|-----------------|
-| `OPEN` | Pulse relay + oscillate servo | `OK`, `DUPLICATE`, `RECOVERED`, `NVS_ERROR`, `FAILED` |
+| `OPEN` | Arm a five-minute proximity window — nothing moves yet | `ARMED`, `DUPLICATE` |
+| `OPEN_NOW` | Pulse relay + oscillate servo immediately, skipping the geofence | `OK`, `DUPLICATE`, `RECOVERED`, `NVS_ERROR`, `FAILED` |
+
+`OPEN` no longer opens the gate on its own. It is acknowledged with `ARMED` and
+the ESP32 then stays awake for five minutes watching `opengate/gps`. The gate
+opens — with a second ACK carrying the *same* command ID and `result` `OK` —
+only once the filtered phone position comes within 100 m of the gate. If that
+never happens the window closes with a `NOT_APPROACHED` ACK and the board goes
+back to sleep.
+
+`OPEN_NOW` is the escape hatch for when the phone has no fix or location
+permission was denied: it behaves exactly like the old `OPEN` did.
+
+| Extra result code | Meaning |
+|---|---|
+| `ARMED` | Proximity window open, waiting for the phone to get close |
+| `NOT_APPROACHED` | Window expired, nobody came within 100 m, gate NOT opened |
 
 ## ESP32 Emulation
 
@@ -153,6 +170,11 @@ Expected output, one line per second:
 gaps in `seq` are messages lost on the way, which QoS 0 allows by design.
 `accuracy` and `speed` only appear when the fix provides them.
 
+The ESP32 subscribes to this topic too, but only between an `OPEN` and the end
+of the five-minute window — subscribing at QoS 0 means the broker never queues
+positions for it while it sleeps, so it can never wake up to a flood of stale
+coordinates.
+
 ---
 
 ## Debug Scenarios
@@ -240,6 +262,49 @@ mosquitto_pub \
 # Terminal 1 should respond with:
 # {"id":"cmd-002","result":"UNKNOWN_COMMAND",...}
 ```
+
+### Scenario 4: Simulate an Approach (proximity opening)
+
+Opens the gate without a phone, by hand-feeding positions that close in on the
+coordinates in `secrets.h`. The values below assume the placeholder gate at
+`45.123456, 9.123456` — recompute them against your own `GATE_LATITUDE` /
+`GATE_LONGITUDE`, otherwise every fix lands kilometres away and nothing opens.
+
+```bash
+# Terminal 1: watch the ACKs
+mosquitto_sub -h <region>.hivemq.cloud -p 8883 -u <username> -P <password> \
+  -t opengate/ack
+
+# Terminal 2: arm the window. The ESP32 answers ARMED and stays awake 5 minutes.
+mosquitto_pub -h <region>.hivemq.cloud -p 8883 -u <username> -P <password> \
+  -t opengate/cmd -q 1 -m '{"id":"cmd-010","command":"OPEN"}'
+
+# Terminal 2: walk in. seq jumps by 10, so the sketch reads each step as 10 s
+# apart — roughly 15 m/s, a plausible car. Send them a few seconds apart.
+for f in \
+  '{"id":"sim-1","seq":10,"lat":45.127053,"lon":9.123456,"accuracy":8.0}' \
+  '{"id":"sim-1","seq":20,"lat":45.125704,"lon":9.123456,"accuracy":8.0}' \
+  '{"id":"sim-1","seq":30,"lat":45.124535,"lon":9.123456,"accuracy":8.0}' \
+  '{"id":"sim-1","seq":40,"lat":45.123996,"lon":9.123456,"accuracy":8.0}' \
+  '{"id":"sim-1","seq":50,"lat":45.123726,"lon":9.123456,"accuracy":8.0}' ; do
+    mosquitto_pub -h <region>.hivemq.cloud -p 8883 -u <username> -P <password> \
+      -t opengate/gps -m "$f"
+    sleep 2
+done
+```
+
+Those five fixes sit about 400, 250, 120, 60 and 30 m north of the gate. The
+first two only teach the filter how fast you are moving; the relay fires on the
+last one, when the *filtered* distance has been under 100 m for two fixes in a
+row. Terminal 1 shows `ARMED` first, then `OK` on the same `cmd-010` ID.
+
+Things that make this scenario fail on purpose, all worth trying:
+
+- Drop `"accuracy"` above 50 m — the fix is rejected as too noisy and ignored.
+- Reuse a `seq` already sent — rejected as out of order.
+- Change `"id"` mid-run — treated as a new tracking session and the filter
+  restarts from scratch, so the confirmation count goes back to zero.
+- Send nothing at all and wait out the five minutes — `NOT_APPROACHED`.
 
 ---
 

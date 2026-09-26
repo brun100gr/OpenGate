@@ -94,6 +94,10 @@ position to `opengate/gps` once a second, with **QoS 0** — a lost fix is simpl
 replaced by the next one a second later. Pressing the button again during a
 session restarts the five minutes without reconnecting.
 
+The two halves are independent in the app but not in the outcome: the ESP32
+treats `OPEN` as "start watching me" and opens the gate only once this stream
+shows you within 100 m of it. See *Proximity Opening* under §3.
+
 The tracking runs in a foreground service, so it keeps going with the screen
 off or the app in the background — which is the whole point, since the phone is
 normally in a car mount. While it is active a silent, persistent notification
@@ -102,10 +106,14 @@ running. The session ends on its own after five minutes and the notification
 disappears.
 
 The first press asks for the **location** permission (and, on Android 13+, for
-the notification permission). Both are optional: if you refuse, the gate still
-opens and only the position stream is skipped. On Android Auto no dialog is
-ever shown — grant the permission once from the phone UI, otherwise the car
-screen just reports that no position was sent.
+the notification permission). Refusing the notification permission costs you
+nothing. Refusing **location** now costs you the gate: with no position stream
+the ESP32 has nothing to measure, so an `OPEN` always expires as
+`NOT_APPROACHED`. The app still sends the command and reports success — it has
+no way to know — so if you mean to refuse the permission, open the gate with
+`OPEN_NOW` instead. On Android Auto no dialog is ever shown: grant the
+permission once from the phone UI, otherwise the car screen just reports that
+no position was sent.
 
 The payload format is documented in [MQTT_DEBUG.md](MQTT_DEBUG.md), which also
 shows how to watch the stream with `mosquitto_sub`.
@@ -134,12 +142,65 @@ Apps not coming from the Play Store must be explicitly enabled:
 1. In the Arduino IDE install the ESP32 board support (*Boards Manager* →
    "esp32" by Espressif) and the **PubSubClient** library (Nick O'Leary).
 2. In `esp32/opengate/`, copy `secrets.h.example` to `secrets.h` and fill it
-   in: WiFi SSID/password, and credentials for both your **test** and
-   **production** HiveMQ clusters. At the top of `secrets.h`, choose your
+   in: WiFi SSID/password, credentials for both your **test** and
+   **production** HiveMQ clusters, and `GATE_LATITUDE` / `GATE_LONGITUDE` (see
+   *Proximity Opening* below). At the top of `secrets.h`, choose your
    environment by setting `#define ENVIRONMENT_TEST` (default) or
    `#define ENVIRONMENT_PROD`.
 3. Upload the sketch and open the serial monitor at 115200 baud: it should
    print `WiFi OK`, `Connecting to MQTT... OK`, `Subscribed to opengate/cmd`.
+
+### Proximity Opening
+
+Pressing **Open gate** does not open the gate. It *arms* the gate: the ESP32
+acknowledges the command with `ARMED`, stays awake for five minutes and follows
+the position stream the phone is publishing on `opengate/gps`. The relay fires
+only when you actually get within 100 m of the gate. Drive away, or never get a
+GPS fix, and the window simply expires with a `NOT_APPROACHED` acknowledgement.
+
+The point is timing: the gate starts opening while you are still coming up the
+road, instead of after you have stopped in front of it.
+
+Positions arrive once a second at QoS 0, so some are lost and all of them carry
+several metres of GPS noise. Feeding raw fixes to a 100 m threshold would make
+the gate flap open on a bad sample, so each coordinate goes through a **Kalman
+filter** (constant-velocity, one per axis) before the distance is computed. The
+filter estimates speed as well as position, which is what lets it bridge the
+gaps: `seq` tells the sketch exactly how many messages went missing, and it
+extrapolates across them while widening its own uncertainty, so the next real
+fix counts for more. Two consecutive confirmations inside the radius are
+required before the relay moves.
+
+`GATE_LATITUDE` / `GATE_LONGITUDE` are the centre of that circle. Read them off
+a map by right-clicking your gate (Google Maps → "What's here?" shows decimal
+degrees), and keep six decimals — that is roughly 0.1 m, far finer than needed.
+They live in `secrets.h` rather than in the sketch because your home
+coordinates are as private as a password.
+
+Tuning lives at the top of `opengate.ino`:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `GEOFENCE_RADIUS_M` | `100.0` | Trigger distance from the gate |
+| `GEOFENCE_CONFIRMATIONS` | `2` | Consecutive fixes inside the radius before opening |
+| `TRACKING_WINDOW_MS` | `300000` | How long the ESP32 follows you after an `OPEN` |
+| `GPS_MAX_ACCURACY_M` | `50.0` | Fixes noisier than this are discarded |
+| `KALMAN_ACCEL_NOISE_MPS2` | `1.5` | How abruptly the filter expects you to change speed |
+
+Three consequences worth knowing:
+
+- **`OPEN_NOW` is the escape hatch.** If location permission is denied, or you
+  are in an underground garage with no fix, a geofenced `OPEN` can never
+  succeed. Publishing `OPEN_NOW` on `opengate/cmd` opens the gate immediately
+  and skips the geofence entirely.
+- **`DEEP_SLEEP_SECONDS` stays at 120**, deliberately, even though the tracking
+  window is five minutes. The phone streams for five minutes *from the button
+  press*; if the board slept that long too, a press made just after it dozed off
+  would be read five minutes later, with the stream already finished. Two
+  minutes guarantees the ESP32 always wakes with time left on the clock.
+- **Battery cost.** Each opening now keeps the board awake for up to five
+  minutes instead of a couple of seconds. On mains power this is irrelevant; on
+  battery, size accordingly or shorten `TRACKING_WINDOW_MS`.
 
 ### TLS Certificates
 
@@ -244,13 +305,23 @@ The phone and DHU should auto-connect; you'll see the OpenGate grid with the "Op
 ## 5. End-to-End Test
 
 1. ESP32 powered and connected (serial monitor open).
-2. From the phone app press **Open gate** → the app shows "Command sent ✓",
-   the serial monitor prints "Valid command: opening the gate", and the
-   relay clicks for one second.
-3. Subscribe to `opengate/gps` (see [MQTT_DEBUG.md](MQTT_DEBUG.md)) and press
-   the button again: one position per second arrives for five minutes, then
-   the stream stops by itself.
-4. Repeat from Android Auto (or from the DHU).
+2. From the phone app press **Open gate** → the app shows "Command sent ✓" and
+   the serial monitor prints that a proximity window has been armed. **The
+   relay does not click yet** — this is the expected behaviour, not a fault.
+3. Subscribe to `opengate/gps` (see [MQTT_DEBUG.md](MQTT_DEBUG.md)): one
+   position per second arrives for five minutes. The serial monitor prints the
+   filtered distance shrinking as you walk or drive toward the gate, and the
+   relay clicks for one second once it drops below 100 m.
+4. Press the button and then stay put, or walk away. After five minutes the
+   window closes, the gate stays shut, and an ACK with `NOT_APPROACHED` is
+   published.
+5. Without moving anywhere, publish `OPEN_NOW` (see [MQTT_DEBUG.md](MQTT_DEBUG.md))
+   → the relay clicks immediately. This is the fallback when GPS is unavailable.
+6. Repeat step 2–3 from Android Auto (or from the DHU).
+
+To rehearse an approach from your desk, without walking anywhere, use
+*Scenario 4* in [MQTT_DEBUG.md](MQTT_DEBUG.md): it feeds the ESP32 a handful of
+coordinates that close in on the gate.
 
 For debugging you can also publish manually from a PC with the Mosquitto
 clients:
@@ -258,7 +329,7 @@ clients:
 ```sh
 mosquitto_pub -h YOUR_CLUSTER.s1.eu.hivemq.cloud -p 8883 \
   -u opengate-app -P 'THE_PASSWORD' --capath /etc/ssl/certs \
-  -t opengate/cmd -m open
+  -t opengate/cmd -q 1 -m '{"id":"cmd-001","command":"OPEN_NOW"}'
 ```
 
 ## 6. Security Notes
@@ -273,6 +344,8 @@ This command opens your home, so:
   prevent MITM on the ESP32 side.
 - **Known limitation**: anyone who obtains the app credentials can open the
   gate; the credentials are compiled into the APK, so do not share the APK.
+  The geofence is not a security control — the same credentials can publish
+  fabricated coordinates on `opengate/gps`, and `OPEN_NOW` skips it anyway.
   Possible evolution: signed payload with a timestamp (HMAC) to prevent
   replay even if the broker is compromised.
 - **Privacy**: `opengate/gps` carries your real position. The same credentials

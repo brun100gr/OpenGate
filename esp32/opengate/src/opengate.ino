@@ -1,9 +1,19 @@
 /*
  * OpenGate — gate side (ESP32)
  *
- * Wakes from deep sleep every DEEP_SLEEP_SECONDS, connects to WiFi and MQTT,
- * collects the commands the broker has queued, executes at most one of them,
- * publishes an MQTT ACK, sends a Telegram notification and goes back to sleep.
+ * Wakes from deep sleep every DEEP_SLEEP_SECONDS, connects to WiFi and MQTT and
+ * collects the commands the broker has queued.
+ *
+ * An OPEN command does NOT move the gate. It ARMS a proximity window: the ESP32
+ * stays awake for TRACKING_WINDOW_MS following the phone position published on
+ * opengate/gps, and opens the gate only once the filtered position is closer
+ * than GEOFENCE_RADIUS_M to the gate (GATE_LATITUDE / GATE_LONGITUDE, both in
+ * secrets.h). If the phone never gets close enough the window expires and the
+ * ESP32 goes back to its sleep / brief-wake cycle without touching the relay.
+ *
+ * OPEN_NOW is the escape hatch: it opens the gate immediately, bypassing the
+ * geofence. It exists because a geofenced OPEN is useless when the location
+ * permission is denied, the phone is underground, or the GPS never gets a fix.
  *
  * MQTT uses a persistent session (cleanSession=false) with a fixed client ID, so
  * QoS 1 commands published while the ESP32 was asleep are delivered on wake.
@@ -11,30 +21,40 @@
  * --------------------------------------------------------------------------
  * DESIGN NOTE 1 — at-most-once hardware action
  *
- * MQTT QoS 1 is at-least-once, so the command transaction turns it into an
- * AT-MOST-ONCE hardware action that survives a reset:
+ * MQTT QoS 1 is at-least-once, so the hardware transaction turns it into an
+ * AT-MOST-ONCE physical action that survives a reset:
  *
- *   1. Persist the command as PENDING in NVS.
+ *   1. Persist the action as PENDING in NVS.
  *   2. Run the handler (relay pulse, servo, ...).
- *   3. Persist the command as PROCESSED and clear PENDING.
+ *   3. Persist the action as PROCESSED and clear PENDING.
  *   4. Publish the ACK and queue the Telegram notification.
  *
- * If the ESP32 resets after step 1 the command is deliberately NOT executed
- * again on the next boot: without a gate-position or relay feedback signal it is
+ * If the ESP32 resets after step 1 the action is deliberately NOT executed again
+ * on the next boot: without a gate-position or relay feedback signal it is
  * impossible to know whether the reset happened before or after the pulse. This
  * design prefers a missed opening over a second, unwanted one.
  *
+ * The transaction key is the command ID for OPEN_NOW, but for a proximity
+ * opening it is the arming command ID plus GATE_TXN_SUFFIX. The arming ID is
+ * already in the processed-ID list — it was committed when OPEN armed the
+ * window — so reusing it would make recoverPendingCommand() mistake an
+ * interrupted pulse for a completed one.
+ *
  * --------------------------------------------------------------------------
- * DESIGN NOTE 2 — the wake is split into two phases
+ * DESIGN NOTE 2 — the wake is split into three phases
  *
  *   1. COLLECT — every queued command is read and PUBACKed, so none of them is
  *      delivered again at the next wake. Nothing is executed, no hardware moves.
  *   2. PROCESS — the collected commands are classified, the ones that will not
- *      run are acknowledged first, and only then does the hardware move.
+ *      run are acknowledged first, and only then does anything happen: OPEN arms
+ *      the proximity window, OPEN_NOW moves the hardware.
+ *   3. TRACK — only when a window was armed. The position fixes are filtered and
+ *      the gate is opened as soon as the phone is close enough.
  *
  * Within a single wake at most one command with an irreversible effect runs: the
  * first that arrived. Every further one is acknowledged as DUPLICATE, exactly
- * like a command whose ID had already been processed.
+ * like a command whose ID had already been processed. OPEN is not irreversible —
+ * re-arming an already armed window merely restarts its countdown.
  *
  * The split matters because the hardware action blocks for several seconds.
  * Executing it while commands were still unacknowledged in the broker queue left
@@ -45,21 +65,26 @@
  * DESIGN NOTE 3 — PUBACK and heap timing
  *
  * PubSubClient sends the QoS 1 PUBACK only AFTER the message callback returns.
- * onMqttMessage() therefore does nothing but parse a command and buffer it; the
- * hardware action, the ACK and the notification all run later, from setup().
- * Slow work inside the callback would hold back the PUBACK, and if the socket
- * died meanwhile the broker would re-deliver the same command forever.
+ * onMqttMessage() therefore does nothing but parse a command or a position fix
+ * and buffer it; the filtering, the hardware action, the ACK and the
+ * notification all run later, from the wake phases. Slow work inside the
+ * callback would hold back the PUBACK, and if the socket died meanwhile the
+ * broker would re-deliver the same command forever.
  *
  * Telegram notifications are deferred until after the MQTT connection is closed:
  * two concurrent mbedTLS sessions need ~40-50 KB of heap each, which is enough
- * to make the handshake fail on an ESP32.
+ * to make the handshake fail on an ESP32. A consequence worth knowing: the ARMED
+ * notification only reaches Telegram once the window is over, together with the
+ * outcome.
  *
  * --------------------------------------------------------------------------
- * Adding a command: write a handler and append one entry to COMMAND_TABLE (see
- * the "Command dispatch" section). Nothing else needs to change.
+ * Adding a command: write a handler returning its ACK result code and append one
+ * entry to COMMAND_TABLE (see the "Command dispatch" section). Nothing else
+ * needs to change.
  *
- * Credentials live in secrets.h (gitignored): copy secrets.h.example to
- * secrets.h and fill in your values. Root CAs live in certificates.h.
+ * Credentials and the gate coordinates live in secrets.h (gitignored): copy
+ * secrets.h.example to secrets.h and fill in your values. Root CAs live in
+ * certificates.h.
  *
  * Required libraries (see platformio.ini):
  *   - PubSubClient (knolleary)
@@ -84,6 +109,7 @@
 // --- MQTT ---
 const char* MQTT_CMD_TOPIC = "opengate/cmd";
 const char* MQTT_ACK_TOPIC = "opengate/ack";
+const char* MQTT_GPS_TOPIC = "opengate/gps";
 const int MQTT_CONNECT_ATTEMPTS = 3;
 const unsigned long MQTT_RETRY_DELAY_MS = 1000;
 const uint16_t MQTT_KEEPALIVE_S = 30;
@@ -94,6 +120,7 @@ const unsigned int MQTT_MAX_PAYLOAD_LEN = 512;
 
 // --- Hardware ---
 const int RELAY_PIN = 26;
+const int BUILTIN_LED_PIN = 2;
 const unsigned long RELAY_PULSE_MS = 1000;
 
 const int SERVO_PIN = 25;
@@ -114,6 +141,9 @@ const unsigned long TIME_SYNC_TIMEOUT_MS = 5000;
 const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; only used as a sanity check
 
 // --- Deep sleep ---
+// Deliberately NOT raised to 300 s: the phone streams its position for five
+// minutes from the button press, so a five-minute sleep would routinely wake the
+// ESP32 after that window had already expired, leaving it nothing to track.
 const uint32_t DEEP_SLEEP_SECONDS = 120;
 const uint64_t DEEP_SLEEP_DURATION_US = (uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL;
 
@@ -125,6 +155,46 @@ const unsigned long MQTT_COLLECT_IDLE_MS = 10000;
 const unsigned long MQTT_COLLECT_GRACE_MS = 500;
 const unsigned long MQTT_COLLECT_MAX_MS = 15000;
 
+// --- Proximity tracking (phase 3) ---
+const unsigned long TRACKING_WINDOW_MS = 300000;  // stay awake 5 min after an OPEN
+const unsigned long TRACKING_POLL_DELAY_MS = 20;
+const int TRACKING_RECONNECT_ATTEMPTS = 2;        // per window, before giving up
+
+// Open the gate once the filtered position is this close to GATE_LATITUDE /
+// GATE_LONGITUDE, confirmed by this many consecutive fixes. Two fixes cost one
+// extra second and stop a single bad measurement from opening the gate.
+const double GEOFENCE_RADIUS_M = 100.0;
+const int GEOFENCE_CONFIRMATIONS = 2;
+
+// Fixes worse than GPS_MAX_ACCURACY_M are discarded outright rather than fed to
+// the filter with a huge R: a 200 m fix carries no usable information.
+const double GPS_MAX_ACCURACY_M = 50.0;
+const double GPS_MIN_ACCURACY_M = 3.0;      // floor, so the measurement variance is never 0
+const double GPS_DEFAULT_ACCURACY_M = 15.0; // when the payload omits "accuracy"
+
+// Nominal interval between two published fixes. dt is derived from the seq gap
+// rather than from arrival time: seq is exact and immune to mobile-network
+// jitter, and a gap directly expresses how many messages were lost.
+// MUST mirror PUBLISH_INTERVAL_MS in the Android GpsTrackingService.
+const double GPS_PUBLISH_INTERVAL_S = 1.0;
+
+// --- Kalman filter (constant velocity) ---
+// Process noise: the acceleration the motion model does not know about. 1.5
+// m/s^2 covers normal driving without letting the filter chase GPS noise.
+const double KALMAN_ACCEL_NOISE_MPS2 = 1.5;
+// At the first fix the speed is completely unknown, so start with a very wide
+// velocity variance and let the first few updates narrow it down.
+const double KALMAN_INITIAL_SPEED_SIGMA_MPS = 30.0;
+// A longer silence than this is treated as this long: the covariance would grow
+// without bound and the prediction would be meaningless anyway.
+const double KALMAN_MAX_GAP_S = 60.0;
+
+const double EARTH_RADIUS_M = 6371000.0;
+
+// Suffix that turns an arming command ID into the ID of the gate transaction it
+// eventually triggers — see DESIGN NOTE 1.
+const char* GATE_TXN_SUFFIX = "@gate";
+
 // Commands buffered during a single wake. Anything beyond this has already been
 // PUBACKed by PubSubClient and is therefore lost, not deferred.
 const int MAX_COLLECTED_COMMANDS = 10;
@@ -132,9 +202,9 @@ const int MAX_COLLECTED_COMMANDS = 10;
 // Maximum number of processed command IDs kept in NVS.
 const int MAX_PROCESSED_IDS = 20;
 
-// Worst case per wake: one recovery + one executed command + the three
-// end-of-wake summaries (duplicates, unsupported, dropped).
-const int MAX_QUEUED_NOTIFICATIONS = 6;
+// Worst case per wake: one recovery + one ARMED + the proximity outcome + the
+// three end-of-wake summaries.
+const int MAX_QUEUED_NOTIFICATIONS = 8;
 
 // =========================== Types =============================
 //
@@ -147,8 +217,38 @@ struct Message {
   char command[32];
 };
 
-// Performs the hardware action for one command type; returns true on success.
-typedef bool (*CommandHandler)();
+// One position fix decoded from opengate/gps.
+struct GpsFix {
+  double lat;
+  double lon;
+  double accuracy;      // metres, 1-sigma; GPS_DEFAULT_ACCURACY_M when absent
+  uint32_t seq;         // increments once per publish attempt within a session
+  char sessionId[64];   // changes on every new tracking session on the phone
+};
+
+// One axis of the constant-velocity Kalman filter, in metres from the gate. The
+// 2x2 covariance is symmetric, so three scalars are enough and the whole filter
+// fits in plain arithmetic — no matrix code on the ESP32.
+struct AxisFilter {
+  double x;    // position (m)
+  double v;    // velocity (m/s)
+  double p00;  // var(x)
+  double p01;  // cov(x, v)
+  double p11;  // var(v)
+};
+
+// What a command that arrived while the proximity window was already running
+// means for that window.
+enum WindowCommandOutcome {
+  WINDOW_CONTINUE,  // nothing changes (duplicate, unsupported)
+  WINDOW_REFRESH,   // another OPEN: restart the countdown
+  WINDOW_END        // the gate was opened, there is nothing left to track
+};
+
+// Performs one command and returns the ACK result code to publish for it
+// ("OK", "ARMED", "FAILED", ...). Receives the command ID because a handler may
+// need to remember which command it is acting for.
+typedef const char* (*CommandHandler)(const String& id);
 
 // One entry of COMMAND_TABLE — see the "Command dispatch" section.
 struct CommandDefinition {
@@ -192,6 +292,32 @@ bool mqttReconnectAttempted = false;
 // has been closed, so the two TLS sessions never compete for heap.
 String notificationQueue[MAX_QUEUED_NOTIFICATIONS];
 int notificationCount = 0;
+
+// --- Proximity tracking state ---
+
+// Set by handleOpen(): the ID of the command that armed the proximity window.
+// It becomes the root of the gate transaction ID once the gate is opened.
+String armedCommandId;
+bool trackingArmed = false;
+
+// Latest fix handed over by the MQTT callback, consumed by the tracking loop.
+GpsFix pendingFix;
+bool pendingFixValid = false;
+
+// The filter runs on metres east/north of the gate, one independent instance per
+// axis: GPS noise is roughly isotropic and uncorrelated between the two.
+AxisFilter filterEast;
+AxisFilter filterNorth;
+bool filterInitialised = false;
+char trackedSessionId[64] = "";
+uint32_t lastTrackedSeq = 0;
+int insideCount = 0;
+
+// Reported at the end of the window, so a failed opening says how close the
+// phone actually got instead of just "it did not work".
+double bestDistanceM = -1.0;
+int gpsFixesUsed = 0;
+int gpsFixesRejected = 0;
 
 // ============================= NVS ==============================
 
@@ -353,11 +479,141 @@ bool parseMessage(const char* json, Message& msg) {
          extractJsonString(json, "command", msg.command, sizeof(msg.command));
 }
 
+// Extracts an unquoted value from flat JSON such as {"key":12.5}. A quoted value
+// makes strtod() consume nothing, which is exactly what keeps {"id":"7f3c..."}
+// from being mistaken for a number.
+bool extractJsonNumber(const char* json, const char* key, double& out) {
+  char pattern[32];
+  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+
+  const char* start = strstr(json, pattern);
+  if (start == nullptr) {
+    return false;
+  }
+  start += strlen(pattern);
+
+  char* end = nullptr;
+  double value = strtod(start, &end);
+  if (end == start) {
+    return false;
+  }
+
+  out = value;
+  return true;
+}
+
+// Fills fix from a position payload. Only the coordinates are mandatory:
+// accuracy and speed are omitted by the phone whenever the fix does not provide
+// them, and a missing accuracy just means the filter has to assume one.
+bool parseGpsFix(const char* json, GpsFix& fix) {
+  if (!extractJsonNumber(json, "lat", fix.lat) ||
+      !extractJsonNumber(json, "lon", fix.lon)) {
+    return false;
+  }
+
+  if (!extractJsonNumber(json, "accuracy", fix.accuracy)) {
+    fix.accuracy = GPS_DEFAULT_ACCURACY_M;
+  }
+
+  double seq = 0.0;
+  fix.seq = extractJsonNumber(json, "seq", seq) ? (uint32_t)seq : 0;
+
+  if (!extractJsonString(json, "id", fix.sessionId, sizeof(fix.sessionId))) {
+    fix.sessionId[0] = '\0';
+  }
+  return true;
+}
+
+// =================== Geofence & Kalman filter ==================
+//
+// The phone publishes one fix per second over QoS 0, so some of them never
+// arrive. Rather than comparing raw coordinates against the geofence, the fixes
+// feed a constant-velocity Kalman filter: it smooths the GPS noise, and because
+// it carries a velocity estimate it keeps predicting where the car is while
+// messages are missing, instead of freezing at the last position received.
+//
+// Everything runs in metres east/north of the gate. Degrees would force the two
+// axes to use different scales (a degree of longitude is worth less than one of
+// latitude), and metres make every tuning constant directly readable.
+
+// Equirectangular projection centred on the gate. Within a few kilometres of the
+// reference point its error is far below the GPS noise, and it costs one cosine
+// instead of the full geodesic machinery.
+void toLocalMeters(double lat, double lon, double& east, double& north) {
+  const double gateLatRad = GATE_LATITUDE * DEG_TO_RAD;
+  north = EARTH_RADIUS_M * (lat - GATE_LATITUDE) * DEG_TO_RAD;
+  east = EARTH_RADIUS_M * (lon - GATE_LONGITUDE) * DEG_TO_RAD * cos(gateLatRad);
+}
+
+// Seeds one axis from the first measurement: position known to within its own
+// accuracy, velocity completely unknown.
+void axisInit(AxisFilter& f, double z, double r) {
+  f.x = z;
+  f.v = 0.0;
+  f.p00 = r;
+  f.p01 = 0.0;
+  f.p11 = KALMAN_INITIAL_SPEED_SIGMA_MPS * KALMAN_INITIAL_SPEED_SIGMA_MPS;
+}
+
+// Constant-velocity prediction over dt seconds:
+//   P = F*P*F' + Q,  F = [[1, dt], [0, 1]]
+// with the discrete white-noise acceleration model
+//   Q = sigma_a^2 * [[dt^4/4, dt^3/2], [dt^3/2, dt^2]]
+// This is where lost messages pay for themselves: a longer dt inflates the
+// covariance, so the next measurement automatically weighs more.
+void axisPredict(AxisFilter& f, double dt) {
+  f.x += f.v * dt;
+
+  const double p01 = f.p01;
+  const double p11 = f.p11;
+  f.p00 += dt * (2.0 * p01 + dt * p11);
+  f.p01 += dt * p11;
+
+  const double q = KALMAN_ACCEL_NOISE_MPS2 * KALMAN_ACCEL_NOISE_MPS2;
+  const double dt2 = dt * dt;
+  f.p00 += q * dt2 * dt2 / 4.0;
+  f.p01 += q * dt2 * dt / 2.0;
+  f.p11 += q * dt2;
+}
+
+// Measurement update for a position-only observation (H = [1 0]) with variance
+// r. Note that p11 must be updated with the OLD p01.
+void axisUpdate(AxisFilter& f, double z, double r) {
+  const double s = f.p00 + r;
+  const double k0 = f.p00 / s;
+  const double k1 = f.p01 / s;
+  const double y = z - f.x;
+
+  f.x += k0 * y;
+  f.v += k1 * y;
+
+  const double p00 = f.p00;
+  const double p01 = f.p01;
+  f.p00 = p00 - k0 * p00;
+  f.p01 = p01 - k0 * p01;
+  f.p11 = f.p11 - k1 * p01;
+}
+
+// Called when a new tracking session starts: the previous velocity estimate
+// describes a different trip and would poison the first predictions.
+void resetFilter() {
+  filterInitialised = false;
+  lastTrackedSeq = 0;
+  insideCount = 0;
+}
+
+double filteredDistanceM() {
+  return sqrt(filterEast.x * filterEast.x + filterNorth.x * filterNorth.x);
+}
+
 // ======================== Hardware actions =====================
 
 void initHardware() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+
+  pinMode(BUILTIN_LED_PIN, OUTPUT);
+  digitalWrite(BUILTIN_LED_PIN, LOW);
 
   servo.attach(SERVO_PIN);
   servo.write(SERVO_ANGLE_REST);
@@ -377,9 +633,11 @@ void oscillateServo() {
   for (int cycle = 1; cycle <= SERVO_CYCLES; cycle++) {
     Serial.printf("[GPIO] Servo cycle %d/%d\r\n", cycle, SERVO_CYCLES);
 
+    digitalWrite(BUILTIN_LED_PIN, HIGH);
     servo.write(SERVO_ANGLE_ACTIVE);
     delay(SERVO_MOVE_DELAY_MS);
 
+    digitalWrite(BUILTIN_LED_PIN, LOW);
     servo.write(SERVO_ANGLE_REST);
     delay(SERVO_RETURN_DELAY_MS);
   }
@@ -537,6 +795,8 @@ struct ResultText {
 // a generic message, so adding a result code never breaks the notification path.
 const ResultText RESULT_TEXTS[] = {
   {"OK",              "🚪 OpenGate: gate opened"},
+  {"ARMED",           "📡 OpenGate: command received, waiting for you to get close to the gate"},
+  {"NOT_APPROACHED",  "🚪 OpenGate: nobody got close enough, gate NOT opened"},
   {"DUPLICATE",       "⚠️ OpenGate: duplicate command ignored"},
   {"RECOVERED",       "⚠️ OpenGate: command recovered after ESP32 reset; gate was NOT triggered again"},
   {"NVS_ERROR",       "❌ OpenGate: NVS error, gate command NOT executed"},
@@ -648,22 +908,38 @@ bool publishAck(const String& id, const String& result, bool notify = true) {
 // ======================== MQTT callback ========================
 
 // Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
-// only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Commands
-// are therefore only parsed and buffered here; processCollectedCommands() does
-// the actual work once we are back in setup().
+// only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Messages
+// are therefore only parsed and buffered here; processCollectedCommands() and
+// runTrackingWindow() do the actual work once we are back in the wake phases.
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   messageReceived = true;
 
-  Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
-
   if (length >= MQTT_MAX_PAYLOAD_LEN) {
-    Serial.printf("[MQTT] Payload too large (%u bytes), ignored\r\n", length);
+    Serial.printf("[MQTT] Payload too large on %s (%u bytes), ignored\r\n", topic, length);
     return;
   }
 
   char json[MQTT_MAX_PAYLOAD_LEN];
   memcpy(json, payload, length);
   json[length] = '\0';
+
+  // Position fixes arrive once a second for minutes on end, so they get a single
+  // compact log line instead of the full raw payload dump.
+  if (strcmp(topic, MQTT_GPS_TOPIC) == 0) {
+    GpsFix fix;
+    if (!parseGpsFix(json, fix)) {
+      Serial.println("[GPS] Malformed fix, ignored");
+      return;
+    }
+
+    // Overwriting a fix the tracking loop has not consumed yet is deliberate: at
+    // 1 Hz over QoS 0 only the freshest position is worth anything.
+    pendingFix = fix;
+    pendingFixValid = true;
+    return;
+  }
+
+  Serial.printf("[MQTT] Message on %s (%u bytes)\r\n", topic, length);
   Serial.printf("[MQTT] Raw payload: %s\r\n", json);
 
   Message msg;
@@ -686,7 +962,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
 // ======================== Command dispatch =====================
 //
-// To add a command, write a handler returning true on success and append an
+// To add a command, write a handler returning its ACK result code and append an
 // entry to COMMAND_TABLE. Collection, parsing, deduplication, ACK and Telegram
 // notification are already generic.
 //
@@ -697,14 +973,28 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 // they are cheap to repeat, skip the two extra flash writes, and every one of
 // them collected during a wake is executed.
 
-bool handleOpen() {
+const char* handleOpen(const String& id) {
+  // No hardware here. OPEN arms the proximity window; the gate is opened later,
+  // by runTrackingWindow(), and only if the phone actually gets close enough.
+  // Arming is idempotent, which is why this command needs no NVS reservation:
+  // a second OPEN simply restarts the countdown.
+  armedCommandId = id;
+  trackingArmed = true;
+  Serial.printf("[TRACK] Proximity window armed by %s\r\n", id.c_str());
+  return "ARMED";
+}
+
+// Escape hatch for when the geofence cannot work: location permission denied,
+// phone underground, GPS unable to get a fix.
+const char* handleOpenNow(const String& id) {
   pulseRelay();
   oscillateServo();
-  return true;
+  return "OK";
 }
 
 const CommandDefinition COMMAND_TABLE[] = {
-  {"OPEN", handleOpen, true},
+  {"OPEN",     handleOpen,    false},  // arms the proximity window, nothing moves
+  {"OPEN_NOW", handleOpenNow, true},   // opens immediately, bypassing the geofence
 };
 
 const CommandDefinition* findCommand(const char* name) {
@@ -733,7 +1023,7 @@ void executeCommand(const Message& message, const CommandDefinition* definition)
   }
 
   Serial.printf("[CMD] Executing %s id=%s\r\n", message.command, id.c_str());
-  const bool ok = definition->handler();
+  const char* result = definition->handler(id);
 
   // Persist completion before acknowledging. This runs even when the handler
   // reported a failure: the hardware may have moved anyway, and at-most-once
@@ -742,7 +1032,7 @@ void executeCommand(const Message& message, const CommandDefinition* definition)
     // pending_id is deliberately left in NVS: on the next boot the command is
     // treated as already-triggered and the handler will NOT run again.
     Serial.println("[CMD] WARNING: command executed but could not be committed to the processed-ID list");
-    publishAck(id, reserved ? "EXECUTED_NVS_ERROR" : (ok ? "OK" : "FAILED"));
+    publishAck(id, reserved ? "EXECUTED_NVS_ERROR" : result);
     return;
   }
 
@@ -752,7 +1042,7 @@ void executeCommand(const Message& message, const CommandDefinition* definition)
     Serial.println("[CMD] WARNING: processed ID saved but PENDING flag could not be cleared");
   }
 
-  publishAck(id, ok ? "OK" : "FAILED");
+  publishAck(id, result);
 }
 
 // ========================== Wake phases ========================
@@ -820,6 +1110,9 @@ struct CommandPlan {
 // action — the first that arrived. Everything that will not run is acknowledged
 // first, while the socket is still fresh, because the hardware action afterwards
 // blocks for seconds and may outlive the connection.
+//
+// OPEN no longer counts as irreversible: it only arms the proximity window, so a
+// burst of presses re-arms it instead of being collapsed into a single action.
 void processCollectedCommands() {
   if (collectedCount == 0 && droppedCount == 0) {
     Serial.println("[MSG] No command received");
@@ -920,6 +1213,234 @@ void processCollectedCommands() {
   }
 }
 
+// The gate transaction the proximity trigger commits, derived from the command
+// that armed the window. See DESIGN NOTE 1 for why it cannot be the bare command
+// ID: that one is already in the processed-ID list.
+String gateTransactionId(const String& commandId) {
+  return commandId + GATE_TXN_SUFFIX;
+}
+
+// Opens the gate because the phone reached the geofence. Same at-most-once
+// transaction as executeCommand(), on the gate transaction ID.
+void openGateOnApproach(double distance) {
+  const String txnId = gateTransactionId(armedCommandId);
+
+  if (!reservePendingId(txnId)) {
+    Serial.println("[TRACK] Refusing to open: PENDING reservation failed");
+    publishAck(armedCommandId, "NVS_ERROR");
+    return;
+  }
+
+  Serial.printf("[TRACK] Phone is %.0f m away, opening the gate\r\n", distance);
+  pulseRelay();
+  oscillateServo();
+
+  if (!saveProcessedId(txnId)) {
+    Serial.println("[TRACK] WARNING: gate opened but the transaction could not be committed");
+    publishAck(armedCommandId, "EXECUTED_NVS_ERROR");
+    return;
+  }
+
+  if (!clearPendingId(txnId)) {
+    Serial.println("[TRACK] WARNING: transaction committed but PENDING flag could not be cleared");
+  }
+
+  // The generic Telegram text for OK says nothing about the approach, so the
+  // notification is queued by hand with the distance that triggered it.
+  publishAck(armedCommandId, "OK", false);
+  queueMessage("🚪 OpenGate: gate opened on approach (" + String(distance, 0) +
+               " m)\nCommand ID: " + armedCommandId);
+}
+
+// Feeds one fix to the filter and reports whether the gate should now open.
+bool consumeFix(const GpsFix& fix) {
+  if (fix.accuracy > GPS_MAX_ACCURACY_M) {
+    gpsFixesRejected++;
+    Serial.printf("[GPS] seq=%u discarded, accuracy %.0f m is worse than %.0f m\r\n",
+                  fix.seq, fix.accuracy, GPS_MAX_ACCURACY_M);
+    return false;
+  }
+
+  // A different session ID means the phone started a new tracking session: the
+  // velocity estimate belongs to a previous trip and seq restarted from zero.
+  if (strcmp(fix.sessionId, trackedSessionId) != 0) {
+    Serial.printf("[GPS] New tracking session %s\r\n", fix.sessionId);
+    strncpy(trackedSessionId, fix.sessionId, sizeof(trackedSessionId) - 1);
+    trackedSessionId[sizeof(trackedSessionId) - 1] = '\0';
+    resetFilter();
+  } else if (filterInitialised && fix.seq <= lastTrackedSeq) {
+    // QoS 0 loses messages, it does not reorder them, but a repeated or stale
+    // fix would still corrupt dt and drag the velocity estimate backwards.
+    Serial.printf("[GPS] seq=%u is not newer than %u, ignored\r\n", fix.seq, lastTrackedSeq);
+    return false;
+  }
+
+  double east = 0.0;
+  double north = 0.0;
+  toLocalMeters(fix.lat, fix.lon, east, north);
+
+  double sigma = fix.accuracy < GPS_MIN_ACCURACY_M ? GPS_MIN_ACCURACY_M : fix.accuracy;
+  const double r = sigma * sigma;
+
+  if (!filterInitialised) {
+    axisInit(filterEast, east, r);
+    axisInit(filterNorth, north, r);
+    filterInitialised = true;
+  } else {
+    // dt comes from the seq gap, not from arrival time: seq is exact, immune to
+    // network jitter, and a gap of n is precisely n lost messages.
+    double dt = (double)(fix.seq - lastTrackedSeq) * GPS_PUBLISH_INTERVAL_S;
+    if (dt > KALMAN_MAX_GAP_S) {
+      dt = KALMAN_MAX_GAP_S;
+    }
+
+    axisPredict(filterEast, dt);
+    axisPredict(filterNorth, dt);
+    axisUpdate(filterEast, east, r);
+    axisUpdate(filterNorth, north, r);
+  }
+
+  lastTrackedSeq = fix.seq;
+  gpsFixesUsed++;
+
+  const double distance = filteredDistanceM();
+  if (bestDistanceM < 0.0 || distance < bestDistanceM) {
+    bestDistanceM = distance;
+  }
+
+  // Requiring GEOFENCE_CONFIRMATIONS consecutive fixes inside the radius costs
+  // about a second and stops one bad measurement from opening the gate.
+  if (distance <= GEOFENCE_RADIUS_M) {
+    insideCount++;
+  } else {
+    insideCount = 0;
+  }
+
+  Serial.printf("[GPS] seq=%u lat=%.6f lon=%.6f acc=%.0fm -> filtered distance %.0f m (inside %d/%d)\r\n",
+                fix.seq, fix.lat, fix.lon, fix.accuracy, distance, insideCount, GEOFENCE_CONFIRMATIONS);
+
+  return insideCount >= GEOFENCE_CONFIRMATIONS;
+}
+
+// A command that arrives while the window is already running was buffered by the
+// callback exactly as in phase 1, but phase 2 is long over. Classifying it here
+// rather than after the window keeps the ACK useful.
+WindowCommandOutcome handleCommandDuringWindow(const Message& message) {
+  const String id(message.id);
+  Serial.printf("[TRACK] Command during window: id=%s, command=%s\r\n", message.id, message.command);
+
+  if (hasProcessedId(id)) {
+    publishAck(id, "DUPLICATE", false);
+    return WINDOW_CONTINUE;
+  }
+
+  const CommandDefinition* definition = findCommand(message.command);
+  if (definition == nullptr) {
+    saveProcessedId(id);
+    publishAck(id, "UNKNOWN_COMMAND", false);
+    return WINDOW_CONTINUE;
+  }
+
+  executeCommand(message, definition);
+
+  // The only commands that reserve are the ones that move the hardware, and with
+  // the gate already open there is nothing left to track. Anything else is an
+  // OPEN, which re-armed the window under a new ID: restart the countdown.
+  return definition->requiresReservation ? WINDOW_END : WINDOW_REFRESH;
+}
+
+// Phase 3: stay awake following the phone until it reaches the geofence or the
+// window expires. Reached only when phase 2 armed a window.
+void runTrackingWindow() {
+  // QoS 0 on purpose. A persistent session never queues QoS 0 messages for an
+  // offline client, so this subscription cannot flood the ESP32 with stale
+  // positions at the next wake; the unsubscribe at the end keeps the sleeping
+  // session limited to the command topic anyway.
+  if (mqtt.subscribe(MQTT_GPS_TOPIC, 0)) {
+    Serial.printf("[TRACK] Subscribed to %s (QoS 0)\r\n", MQTT_GPS_TOPIC);
+  } else {
+    Serial.printf("[TRACK] ERROR: failed to subscribe to %s\r\n", MQTT_GPS_TOPIC);
+  }
+
+  Serial.printf("[TRACK] Waiting up to %lu s for the phone to get within %.0f m\r\n",
+                TRACKING_WINDOW_MS / 1000, GEOFENCE_RADIUS_M);
+
+  unsigned long windowStart = millis();
+  int handledCommands = collectedCount;  // everything before this ran in phase 2
+  int reconnects = 0;
+  bool opened = false;
+  bool aborted = false;
+
+  while (millis() - windowStart < TRACKING_WINDOW_MS) {
+    if (!mqtt.connected()) {
+      if (reconnects >= TRACKING_RECONNECT_ATTEMPTS) {
+        Serial.println("[TRACK] Connection lost for good, abandoning the window");
+        aborted = true;
+        break;
+      }
+      reconnects++;
+      Serial.printf("[TRACK] Connection lost, reconnecting (%d/%d)\r\n",
+                    reconnects, TRACKING_RECONNECT_ATTEMPTS);
+      connectMqtt();
+      if (mqtt.connected()) {
+        mqtt.subscribe(MQTT_GPS_TOPIC, 0);
+      }
+      continue;
+    }
+
+    mqtt.loop();
+
+    bool ended = false;
+    while (handledCommands < collectedCount) {
+      const WindowCommandOutcome outcome = handleCommandDuringWindow(collectedCommands[handledCommands]);
+      handledCommands++;
+      if (outcome == WINDOW_REFRESH) {
+        windowStart = millis();
+        Serial.println("[TRACK] Window countdown restarted");
+      } else if (outcome == WINDOW_END) {
+        opened = true;
+        ended = true;
+      }
+    }
+    if (ended) {
+      break;
+    }
+
+    if (pendingFixValid) {
+      pendingFixValid = false;
+      if (consumeFix(pendingFix)) {
+        openGateOnApproach(filteredDistanceM());
+        opened = true;
+        break;
+      }
+    }
+
+    delay(TRACKING_POLL_DELAY_MS);
+  }
+
+  if (mqtt.connected()) {
+    mqtt.unsubscribe(MQTT_GPS_TOPIC);
+  }
+
+  Serial.printf("[TRACK] Window ended after %lu s: %d fix(es) used, %d rejected\r\n",
+                (millis() - windowStart) / 1000, gpsFixesUsed, gpsFixesRejected);
+
+  if (opened || aborted) {
+    return;
+  }
+
+  // The generic Telegram text cannot say how close the phone got, which is the
+  // one detail that makes a failed opening diagnosable.
+  publishAck(armedCommandId, "NOT_APPROACHED", false);
+  if (bestDistanceM < 0.0) {
+    queueMessage("🚪 OpenGate: no position received, gate NOT opened\nCommand ID: " + armedCommandId);
+  } else {
+    queueMessage("🚪 OpenGate: closest approach was " + String(bestDistanceM, 0) +
+                 " m, more than the " + String(GEOFENCE_RADIUS_M, 0) +
+                 " m needed; gate NOT opened\nCommand ID: " + armedCommandId);
+  }
+}
+
 // Runs before phase 1, so a hardware transaction interrupted by a reset can
 // never be executed a second time by a command that arrives now.
 void recoverPendingCommand() {
@@ -928,31 +1449,38 @@ void recoverPendingCommand() {
     return;
   }
 
-  Serial.printf("[RECOVERY] Found pending command after reset: %s\r\n", pendingId.c_str());
+  Serial.printf("[RECOVERY] Found pending transaction after reset: %s\r\n", pendingId.c_str());
+
+  // NVS keys the transaction, but the publisher only knows the command ID it
+  // sent, so the gate suffix is stripped before the ACK goes out.
+  String ackId = pendingId;
+  if (ackId.endsWith(GATE_TXN_SUFFIX)) {
+    ackId = ackId.substring(0, ackId.length() - strlen(GATE_TXN_SUFFIX));
+  }
 
   // If it is already in the processed-ID list, the previous boot completed the
   // hardware action and persisted completion; only the final cleanup was
   // interrupted.
   if (hasProcessedId(pendingId)) {
-    Serial.println("[RECOVERY] Command already committed as PROCESSED; clearing stale PENDING flag");
+    Serial.println("[RECOVERY] Transaction already committed as PROCESSED; clearing stale PENDING flag");
     clearPendingId(pendingId);
     return;
   }
 
   // We cannot know whether the relay pulse completed before the reset. To prevent
   // a second gate opening, never run the handler again — just report the state.
-  Serial.println("[RECOVERY] Command execution state is uncertain; relay will NOT be triggered again");
+  Serial.println("[RECOVERY] Execution state is uncertain; relay will NOT be triggered again");
 
   // If the outcome cannot be reported, leave PENDING in NVS and retry recovery
   // at the next boot.
-  if (!publishAck(pendingId, "RECOVERED")) {
-    Serial.println("[RECOVERY] MQTT ACK failed; keeping PENDING command for next boot");
+  if (!publishAck(ackId, "RECOVERED")) {
+    Serial.println("[RECOVERY] MQTT ACK failed; keeping PENDING transaction for next boot");
     return;
   }
 
   if (saveProcessedId(pendingId)) {
     clearPendingId(pendingId);
-    Serial.println("[RECOVERY] Pending command marked PROCESSED without re-triggering relay");
+    Serial.println("[RECOVERY] Pending transaction marked PROCESSED without re-triggering relay");
   } else {
     Serial.println("[RECOVERY] WARNING: ACK sent but processed ID could not be saved; keeping PENDING flag");
   }
@@ -974,9 +1502,16 @@ void runWakeCycle() {
   // wake starts from an empty queue.
   collectQueuedCommands();
 
-  // Phase 2: decide and execute. mqtt.loop() is never called again from here on,
-  // so no new message can arrive while the hardware is busy.
+  // Phase 2: decide, arm, and run at most one hardware action.
   processCollectedCommands();
+
+  // Phase 3: an OPEN did not move anything, it armed a proximity window. Stay
+  // awake following the phone until it is close enough, or until time runs out.
+  // Unlike phase 2 this does service mqtt.loop(), so commands arriving now are
+  // handled inside the window instead of being silently buffered.
+  if (trackingArmed) {
+    runTrackingWindow();
+  }
 
   if (mqtt.connected()) {
     mqtt.disconnect();
