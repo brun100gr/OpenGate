@@ -4,23 +4,49 @@ import android.Manifest
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import java.util.Locale
 
 /** Phone UI: a single button that sends the MQTT command. */
 class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
+    private lateinit var countdownText: TextView
     private lateinit var openButton: Button
+
+    private val countdownListener = GpsTrackingService.OnCountdownListener { secondsLeft ->
+        if (secondsLeft > 0) {
+            val minutes = secondsLeft / 60
+            val seconds = secondsLeft % 60
+            val formattedTime = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+            countdownText.text = getString(R.string.gps_countdown, formattedTime)
+            countdownText.visibility = View.VISIBLE
+        } else {
+            countdownText.visibility = View.GONE
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
+        countdownText = findViewById(R.id.countdownText)
         openButton = findViewById(R.id.openButton)
         openButton.setOnClickListener { openGate() }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        GpsTrackingService.addOnCountdownListener(countdownListener)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        GpsTrackingService.removeOnCountdownListener(countdownListener)
     }
 
     private fun openGate() {

@@ -12,9 +12,12 @@ import androidx.car.app.model.GridTemplate
 import androidx.car.app.model.ItemList
 import androidx.car.app.model.Template
 import androidx.core.graphics.drawable.IconCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import com.opengate.GpsTrackingService
 import com.opengate.MqttPublisher
 import com.opengate.R
+import java.util.Locale
 
 /**
  * Screen shown on the car display: a single grid cell with the gate icon.
@@ -26,6 +29,22 @@ class GateScreen(carContext: CarContext) : Screen(carContext) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var sending = false
+
+    private val countdownListener = GpsTrackingService.OnCountdownListener {
+        mainHandler.post { invalidate() }
+    }
+
+    init {
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) {
+                GpsTrackingService.addOnCountdownListener(countdownListener)
+            }
+
+            override fun onStop(owner: LifecycleOwner) {
+                GpsTrackingService.removeOnCountdownListener(countdownListener)
+            }
+        })
+    }
 
     override fun onGetTemplate(): Template {
         val itemBuilder = GridItem.Builder()
@@ -42,6 +61,14 @@ class GateScreen(carContext: CarContext) : Screen(carContext) {
                     GridItem.IMAGE_TYPE_ICON
                 )
                 .setOnClickListener { openGate() }
+
+            val secondsLeft = GpsTrackingService.remainingSeconds.value
+            if (secondsLeft > 0) {
+                val minutes = secondsLeft / 60
+                val seconds = secondsLeft % 60
+                val formattedTime = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+                itemBuilder.setText(carContext.getString(R.string.gps_countdown, formattedTime))
+            }
         }
 
         return GridTemplate.Builder()

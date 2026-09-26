@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.location.Location
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
@@ -26,10 +27,15 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Streams the phone position to the broker for [SESSION_DURATION_MS] after the
@@ -44,6 +50,10 @@ import java.util.concurrent.TimeUnit
  * phone sits still, and the requirement here is a message every second.
  */
 class GpsTrackingService : Service() {
+
+    fun interface OnCountdownListener {
+        fun onCountdownTick(secondsLeft: Int)
+    }
 
     private lateinit var fusedClient: FusedLocationProviderClient
     private lateinit var worker: ScheduledExecutorService
@@ -74,6 +84,12 @@ class GpsTrackingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A second press only pushes the deadline forward: the MQTT
+        // connection, the session id and the sequence counter carry on.
+        deadline = SystemClock.elapsedRealtime() + SESSION_DURATION_MS
+        val initialSeconds = (SESSION_DURATION_MS / 1000).toInt()
+        notifyCountdown(initialSeconds)
+
         // Must happen within a few seconds of startForegroundService(), so it
         // comes first: it only fails if the location permission was revoked
         // between the button press and now.
@@ -81,7 +97,7 @@ class GpsTrackingService : Service() {
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
-                buildNotification(),
+                buildNotification(initialSeconds),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
                 } else {
@@ -90,13 +106,10 @@ class GpsTrackingService : Service() {
             )
         } catch (e: Exception) {
             Log.e(TAG, "Could not go foreground", e)
+            notifyCountdown(0)
             stopSelf()
             return START_NOT_STICKY
         }
-
-        // A second press only pushes the deadline forward: the MQTT
-        // connection, the session id and the sequence counter carry on.
-        deadline = SystemClock.elapsedRealtime() + SESSION_DURATION_MS
 
         if (tracking) {
             Log.d(TAG, "Session extended by another press")
@@ -119,6 +132,7 @@ class GpsTrackingService : Service() {
             fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
         } catch (e: SecurityException) {
             Log.e(TAG, "Location permission revoked", e)
+            notifyCountdown(0)
             stopSelf()
             return
         }
@@ -135,11 +149,18 @@ class GpsTrackingService : Service() {
     }
 
     private fun tick() {
-        if (SystemClock.elapsedRealtime() >= deadline) {
+        val now = SystemClock.elapsedRealtime()
+        if (now >= deadline) {
             Log.d(TAG, "Session over")
+            notifyCountdown(0)
             stopSelf()
             return
         }
+
+        val remainingMs = maxOf(0L, deadline - now)
+        val secondsLeft = ((remainingMs + 999) / 1000).toInt()
+        notifyCountdown(secondsLeft)
+        updateNotification(secondsLeft)
 
         val location = lastLocation
         if (location == null) {
@@ -152,6 +173,7 @@ class GpsTrackingService : Service() {
     }
 
     override fun onDestroy() {
+        notifyCountdown(0)
         fusedClient.removeLocationUpdates(locationCallback)
         // Queued before the shutdown so it still runs, and on the worker
         // thread because disconnecting talks to the network.
@@ -164,7 +186,16 @@ class GpsTrackingService : Service() {
         super.onDestroy()
     }
 
-    private fun buildNotification(): Notification {
+    private fun updateNotification(secondsLeft: Int) {
+        val notificationManager = NotificationManagerCompat.from(this)
+        try {
+            notificationManager.notify(NOTIFICATION_ID, buildNotification(secondsLeft))
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Notification permission missing when updating notification", e)
+        }
+    }
+
+    private fun buildNotification(secondsLeft: Int = (SESSION_DURATION_MS / 1000).toInt()): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationManagerCompat.from(this).createNotificationChannel(
                 NotificationChannel(
@@ -183,9 +214,14 @@ class GpsTrackingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val minutes = secondsLeft / 60
+        val seconds = secondsLeft % 60
+        val formattedTime = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+        val bodyText = getString(R.string.gps_notification_text, formattedTime)
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.gps_notification_title))
-            .setContentText(getString(R.string.gps_notification_text))
+            .setContentText(bodyText)
             .setSmallIcon(R.drawable.ic_gate)
             .setContentIntent(contentIntent)
             .setOngoing(true)
@@ -198,6 +234,28 @@ class GpsTrackingService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val PUBLISH_INTERVAL_MS = 1_000L
         private const val SESSION_DURATION_MS = 5 * 60 * 1_000L
+
+        private val _remainingSeconds = MutableStateFlow(0)
+        val remainingSeconds: StateFlow<Int> = _remainingSeconds.asStateFlow()
+
+        private val listeners = CopyOnWriteArrayList<OnCountdownListener>()
+
+        fun addOnCountdownListener(listener: OnCountdownListener) {
+            listeners.add(listener)
+            listener.onCountdownTick(_remainingSeconds.value)
+        }
+
+        fun removeOnCountdownListener(listener: OnCountdownListener) {
+            listeners.remove(listener)
+        }
+
+        private fun notifyCountdown(secondsLeft: Int) {
+            _remainingSeconds.value = secondsLeft
+            val mainHandler = Handler(Looper.getMainLooper())
+            for (listener in listeners) {
+                mainHandler.post { listener.onCountdownTick(secondsLeft) }
+            }
+        }
 
         fun hasLocationPermission(context: Context): Boolean =
             ContextCompat.checkSelfPermission(

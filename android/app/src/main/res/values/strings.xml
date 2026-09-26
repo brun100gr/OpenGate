@@ -11,7 +11,8 @@
     <!-- GPS tracking started by the button -->
     <string name="gps_channel_name">Gate GPS tracking</string>
     <string name="gps_notification_title">OpenGate</string>
-    <string name="gps_notification_text">Sending your position for 5 minutes</string>
+    <string name="gps_notification_text">Sending position: %1$s remaining</string>
+    <string name="gps_countdown">Sending position: %1$s remaining</string>
     <string name="gps_permission_denied">Location permission denied: position not sent</string>
     <string name="gps_unavailable">Position not sent</string>
     <string name="gps_unavailable_short">No position sent</string>

@@ -21,4 +21,14 @@
         android:text="@string/press_to_open"
         android:textSize="16sp" />
 
+    <TextView
+        android:id="@+id/countdownText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:textColor="#1976D2"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
 </LinearLayout>

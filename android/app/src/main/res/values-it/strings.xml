@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenGate</string>
+    <string name="open_gate">Apri cancello</string>
+    <string name="press_to_open">Premi per aprire il cancello</string>
+    <string name="sending">Invio comando in corso…</string>
+    <string name="sent_ok">Comando inviato ✓</string>
+    <string name="sent_error">Errore: %1$s</string>
+    <string name="sent_error_short">Invio fallito</string>
+
+    <!-- GPS tracking started by the button -->
+    <string name="gps_channel_name">Tracciamento GPS cancello</string>
+    <string name="gps_notification_title">OpenGate</string>
+    <string name="gps_notification_text">Invio posizione: %1$s rimanenti</string>
+    <string name="gps_countdown">Invio posizione: %1$s rimanenti</string>
+    <string name="gps_permission_denied">Permesso posizione negato: posizione non inviata</string>
+    <string name="gps_unavailable">Posizione non inviata</string>
+    <string name="gps_unavailable_short">Nessuna posizione inviata</string>
+</resources>
