@@ -9,12 +9,12 @@ Documentation of `mosquitto_pub` and `mosquitto_sub` commands to emulate ESP32 a
 - **ACK topic**: `opengate/ack` (QoS 0)
 - **GPS topic**: `opengate/gps` (QoS 0, published by the Android app, read by the
   ESP32 only while a proximity window is open)
-- **Gate state topic**: `opengate/gate_state` (QoS 1, published by the ESP32,
+- **Gate state topic**: `opengate/gate_state` (QoS 0, published by the ESP32,
   read by the Android app)
 - **Command format**: `{"id":"<uuid>","command":"<command-name>"}`
 - **ACK format**: `{"id":"<uuid>","result":"<result-code>","timestamp":"<iso-timestamp>"}`
 - **GPS format**: `{"id":"<session-uuid>","seq":<n>,"lat":<deg>,"lon":<deg>,"accuracy":<m>,"speed":<m/s>,"timestamp":"<iso-timestamp>"}`
-- **Gate state format**: `{"state":"waiting"}` or `{"state":"open"}`
+- **Gate state format**: `{"state":"waiting"}`, `{"state":"open"}` or `{"state":"unknown"}`
 
 ## Supported Commands
 
@@ -180,9 +180,17 @@ coordinates.
 
 ### Push a Gate State
 
-The app subscribes to `opengate/gate_state` and shows it in the phone UI:
-`unknown` in grey until the first message, `waiting` in yellow, `open` in green.
-An `open` also ends the GPS stream early — there is nothing left to follow.
+The ESP32 publishes it at three moments: `waiting` when an `OPEN` arms the
+proximity window, `open` the instant the opening procedure starts — before the
+relay pulse, so the phone stops streaming while the gate is still moving — and
+`unknown` when the window expires without an opening, so the app does not stay
+on `waiting` while the board sleeps. Nothing is published during the sleep
+itself.
+
+The app subscribes to the topic and shows it: `unknown` in grey, `waiting` in
+yellow, `open` in green. An `open` also ends the GPS stream early.
+
+To emulate the ESP32:
 
 ```bash
 # Proximity window armed, the ESP32 is waiting for the car

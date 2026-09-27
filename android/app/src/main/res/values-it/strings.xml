@@ -21,4 +21,9 @@
     <string name="gate_state_unknown">Cancello: sconosciuto</string>
     <string name="gate_state_waiting">Cancello: in attesa</string>
     <string name="gate_state_open">Cancello: aperto</string>
+
+    <!-- Distance to home -->
+    <string name="distance_calculating">Calcolo distanza in corso…</string>
+    <string name="distance_format">Distanza da casa: %1$.0f m</string>
+    <string name="distance_format_km">Distanza da casa: %1$.2f km</string>
 </resources>

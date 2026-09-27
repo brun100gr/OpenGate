@@ -110,6 +110,7 @@
 const char* MQTT_CMD_TOPIC = "opengate/cmd";
 const char* MQTT_ACK_TOPIC = "opengate/ack";
 const char* MQTT_GPS_TOPIC = "opengate/gps";
+const char* MQTT_STATE_TOPIC = "opengate/gate_state";
 const int MQTT_CONNECT_ATTEMPTS = 3;
 const unsigned long MQTT_RETRY_DELAY_MS = 1000;
 const uint16_t MQTT_KEEPALIVE_S = 30;
@@ -117,6 +118,13 @@ const uint16_t MQTT_KEEPALIVE_S = 30;
 // Largest command payload we are willing to parse. Payloads above PubSubClient's
 // own MQTT_MAX_PACKET_SIZE never reach the callback in the first place.
 const unsigned int MQTT_MAX_PAYLOAD_LEN = 512;
+
+// Gate states reported on MQTT_STATE_TOPIC. "unknown" is both the state the app
+// starts from and the one it goes back to when a wake ends without an opening:
+// a sleeping board has nothing to report.
+const char* GATE_STATE_UNKNOWN = "unknown";  // window over, gate not opened
+const char* GATE_STATE_WAITING = "waiting";  // window armed, following the phone
+const char* GATE_STATE_OPEN = "open";        // opening procedure started
 
 // --- Hardware ---
 const int RELAY_PIN = 26;
@@ -905,8 +913,34 @@ bool publishAck(const String& id, const String& result, bool notify = true) {
   return mqttOk;
 }
 
-// ======================== MQTT callback ========================
+// ========================== Gate state =========================
 
+// Publishes the gate state the Android app shows on screen. Never retained: a
+// retained state would survive the deep sleep and the app would keep displaying
+// it while the board is off, instead of the "unknown" that sleep really means.
+//
+// Returns nothing on purpose. The state is a courtesy to the UI, not part of the
+// command protocol — the ACK already carries the outcome — so no caller should
+// change what it does because the broker was unreachable for a moment.
+void publishGateState(const char* state) {
+  if (!mqtt.connected()) {
+    Serial.printf("[STATE] MQTT not connected, '%s' not published\r\n", state);
+    return;
+  }
+
+  char payload[64];
+  snprintf(payload, sizeof(payload), "{\"state\":\"%s\"}", state);
+
+  // QoS 0 like the ACK: PubSubClient cannot publish at QoS 1, and a state that
+  // arrives late is worth less than the next one anyway.
+  if (mqtt.publish(MQTT_STATE_TOPIC, payload, false)) {
+    Serial.printf("[STATE] Published: %s\r\n", payload);
+  } else {
+    Serial.printf("[STATE] Failed to publish: %s\r\n", payload);
+  }
+}
+
+// ======================== MQTT callback ========================
 // Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
 // only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Messages
 // are therefore only parsed and buffered here; processCollectedCommands() and
@@ -981,12 +1015,16 @@ const char* handleOpen(const String& id) {
   armedCommandId = id;
   trackingArmed = true;
   Serial.printf("[TRACK] Proximity window armed by %s\r\n", id.c_str());
+  publishGateState(GATE_STATE_WAITING);
   return "ARMED";
 }
 
 // Escape hatch for when the geofence cannot work: location permission denied,
 // phone underground, GPS unable to get a fix.
 const char* handleOpenNow(const String& id) {
+  // Announced before the hardware runs: pulse and servo block for seconds, and
+  // the phone should stop streaming its position as early as possible.
+  publishGateState(GATE_STATE_OPEN);
   pulseRelay();
   oscillateServo();
   return "OK";
@@ -1232,6 +1270,7 @@ void openGateOnApproach(double distance) {
   }
 
   Serial.printf("[TRACK] Phone is %.0f m away, opening the gate\r\n", distance);
+  publishGateState(GATE_STATE_OPEN);
   pulseRelay();
   oscillateServo();
 
@@ -1424,6 +1463,14 @@ void runTrackingWindow() {
 
   Serial.printf("[TRACK] Window ended after %lu s: %d fix(es) used, %d rejected\r\n",
                 (millis() - windowStart) / 1000, gpsFixesUsed, gpsFixesRejected);
+
+  // Nothing was opened and the board is about to sleep, so the app must not be
+  // left on "waiting" until the next command. Skipped after an opening, whose
+  // "open" is the last word of this wake, and a no-op when the window was
+  // abandoned with the connection already gone.
+  if (!opened) {
+    publishGateState(GATE_STATE_UNKNOWN);
+  }
 
   if (opened || aborted) {
     return;

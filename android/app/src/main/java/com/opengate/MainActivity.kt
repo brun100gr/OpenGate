@@ -2,13 +2,22 @@ package com.opengate
 
 import android.Manifest
 import android.app.Activity
+import android.graphics.Color
+import android.location.Location
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import java.util.Locale
 
 /** Phone UI: a single button that sends the MQTT command. */
@@ -17,7 +26,16 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var countdownText: TextView
     private lateinit var gateStateText: TextView
+    private lateinit var distanceText: TextView
     private lateinit var openButton: Button
+
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+
+    private val uiLocationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            result.lastLocation?.let { updateDistance(it) }
+        }
+    }
 
     private val countdownListener = GpsTrackingService.OnCountdownListener { secondsLeft ->
         if (secondsLeft > 0) {
@@ -45,9 +63,12 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
         statusText = findViewById(R.id.statusText)
         countdownText = findViewById(R.id.countdownText)
         gateStateText = findViewById(R.id.gateStateText)
+        distanceText = findViewById(R.id.distanceText)
         openButton = findViewById(R.id.openButton)
         openButton.setOnClickListener { openGate() }
     }
@@ -56,12 +77,70 @@ class MainActivity : Activity() {
         super.onStart()
         GpsTrackingService.addOnCountdownListener(countdownListener)
         GateStateMonitor.addListener(gateStateListener)
+        startLocationUpdates()
     }
 
     override fun onStop() {
         super.onStop()
         GpsTrackingService.removeOnCountdownListener(countdownListener)
         GateStateMonitor.removeListener(gateStateListener)
+        stopLocationUpdates()
+    }
+
+    private fun startLocationUpdates() {
+        if (!GpsTrackingService.hasLocationPermission(this)) return
+        try {
+            fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                if (loc != null) updateDistance(loc)
+            }
+
+            val request = LocationRequest.Builder(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                2000L
+            ).setMinUpdateIntervalMillis(1000L).build()
+
+            fusedLocationClient.requestLocationUpdates(
+                request,
+                uiLocationCallback,
+                Looper.getMainLooper()
+            )
+        } catch (_: SecurityException) {
+            // Permission check covered above
+        }
+    }
+
+    private fun stopLocationUpdates() {
+        fusedLocationClient.removeLocationUpdates(uiLocationCallback)
+    }
+
+    private fun updateDistance(location: Location) {
+        val homeLocation = Location("").apply {
+            latitude = Config.LATITUDE
+            longitude = Config.LONGITUDE
+        }
+        val distanceMeters = location.distanceTo(homeLocation).toDouble()
+
+        val textStr = if (distanceMeters >= 1000) {
+            getString(R.string.distance_format_km, distanceMeters / 1000.0)
+        } else {
+            getString(R.string.distance_format, distanceMeters)
+        }
+
+        distanceText.text = textStr
+        distanceText.setTextColor(getDistanceColor(distanceMeters))
+    }
+
+    private fun getDistanceColor(distanceMeters: Double): Int {
+        val hue = when {
+            distanceMeters >= 200.0 -> 0.0f  // Rosso (> 200m)
+            distanceMeters <= 100.0 -> 120.0f // Verde (<= 100m)
+            else -> {
+                // Sfumatura tra 200m e 100m: 0° (Rosso) -> Arancione -> Giallo -> 120° (Verde)
+                val t = ((200.0 - distanceMeters) / 100.0).toFloat()
+                t * 120.0f
+            }
+        }
+        return Color.HSVToColor(floatArrayOf(hue, 1.0f, 0.85f))
     }
 
     private fun openGate() {
@@ -112,8 +191,11 @@ class MainActivity : Activity() {
         // the position stream.
         if (!GpsTrackingService.hasLocationPermission(this)) {
             toast(R.string.gps_permission_denied)
-        } else if (!GpsTrackingService.start(this)) {
-            toast(R.string.gps_unavailable)
+        } else {
+            startLocationUpdates()
+            if (!GpsTrackingService.start(this)) {
+                toast(R.string.gps_unavailable)
+            }
         }
     }
 
