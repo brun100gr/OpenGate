@@ -16,4 +16,9 @@
     <string name="gps_permission_denied">Location permission denied: position not sent</string>
     <string name="gps_unavailable">Position not sent</string>
     <string name="gps_unavailable_short">No position sent</string>
+
+    <!-- Gate state reported by the ESP32 on opengate/gate_state -->
+    <string name="gate_state_unknown">Gate: unknown</string>
+    <string name="gate_state_waiting">Gate: waiting</string>
+    <string name="gate_state_open">Gate: open</string>
 </resources>

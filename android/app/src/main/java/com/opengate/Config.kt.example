@@ -37,5 +37,6 @@ object Config {
     const val CMD_TOPIC = "opengate/cmd"
     const val ACK_TOPIC = "opengate/ack"
     const val GPS_TOPIC = "opengate/gps"
+    const val STATE_TOPIC = "opengate/gate_state"  // Gate state published by the ESP32
     const val COMMAND = "OPEN"  // Command name in the JSON payload
 }

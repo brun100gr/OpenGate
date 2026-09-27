@@ -74,6 +74,17 @@ class GpsTrackingService : Service() {
         }
     }
 
+    /**
+     * The gate is open: the ESP32 has no use for the position any more, so the
+     * session ends early instead of running the full five minutes.
+     */
+    private val gateStateListener = GateStateMonitor.OnGateStateListener { state ->
+        if (state == GateState.OPEN && tracking) {
+            Log.d(TAG, "Gate reported open, stopping the GPS stream")
+            stopSelf()
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -81,6 +92,7 @@ class GpsTrackingService : Service() {
         fusedClient = LocationServices.getFusedLocationProviderClient(this)
         worker = Executors.newSingleThreadScheduledExecutor()
         publisher = GpsPublisher(UUID.randomUUID().toString())
+        GateStateMonitor.addListener(gateStateListener)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -174,6 +186,7 @@ class GpsTrackingService : Service() {
 
     override fun onDestroy() {
         notifyCountdown(0)
+        GateStateMonitor.removeListener(gateStateListener)
         fusedClient.removeLocationUpdates(locationCallback)
         // Queued before the shutdown so it still runs, and on the worker
         // thread because disconnecting talks to the network.

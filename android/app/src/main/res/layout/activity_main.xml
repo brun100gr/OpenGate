@@ -22,6 +22,16 @@
         android:textSize="16sp" />
 
     <TextView
+        android:id="@+id/gateStateText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/gate_state_unknown"
+        android:textColor="@color/gate_state_unknown"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+
+    <TextView
         android:id="@+id/countdownText"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"

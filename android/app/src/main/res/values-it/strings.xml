@@ -16,4 +16,9 @@
     <string name="gps_permission_denied">Permesso posizione negato: posizione non inviata</string>
     <string name="gps_unavailable">Posizione non inviata</string>
     <string name="gps_unavailable_short">Nessuna posizione inviata</string>
+
+    <!-- Gate state reported by the ESP32 on opengate/gate_state -->
+    <string name="gate_state_unknown">Cancello: sconosciuto</string>
+    <string name="gate_state_waiting">Cancello: in attesa</string>
+    <string name="gate_state_open">Cancello: aperto</string>
 </resources>

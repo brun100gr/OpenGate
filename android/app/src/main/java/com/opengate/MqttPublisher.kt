@@ -29,6 +29,10 @@ object MqttPublisher {
     private val executor = Executors.newSingleThreadExecutor()
 
     fun publish(onResult: (success: Boolean, error: String?) -> Unit) {
+        // Whatever the ESP32 said about the previous opening is now stale, and a
+        // leftover "open" would cut the coming GPS session short
+        GateStateMonitor.reset()
+
         executor.execute {
             try {
                 val commandId = UUID.randomUUID().toString()

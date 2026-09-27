@@ -8,6 +8,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import java.util.Locale
 
 /** Phone UI: a single button that sends the MQTT command. */
@@ -15,6 +16,7 @@ class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
     private lateinit var countdownText: TextView
+    private lateinit var gateStateText: TextView
     private lateinit var openButton: Button
 
     private val countdownListener = GpsTrackingService.OnCountdownListener { secondsLeft ->
@@ -29,12 +31,23 @@ class MainActivity : Activity() {
         }
     }
 
+    private val gateStateListener = GateStateMonitor.OnGateStateListener { state ->
+        val (label, color) = when (state) {
+            GateState.UNKNOWN -> R.string.gate_state_unknown to R.color.gate_state_unknown
+            GateState.WAITING -> R.string.gate_state_waiting to R.color.gate_state_waiting
+            GateState.OPEN -> R.string.gate_state_open to R.color.gate_state_open
+        }
+        gateStateText.text = getString(label)
+        gateStateText.setTextColor(ContextCompat.getColor(this, color))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
         countdownText = findViewById(R.id.countdownText)
+        gateStateText = findViewById(R.id.gateStateText)
         openButton = findViewById(R.id.openButton)
         openButton.setOnClickListener { openGate() }
     }
@@ -42,11 +55,13 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         GpsTrackingService.addOnCountdownListener(countdownListener)
+        GateStateMonitor.addListener(gateStateListener)
     }
 
     override fun onStop() {
         super.onStop()
         GpsTrackingService.removeOnCountdownListener(countdownListener)
+        GateStateMonitor.removeListener(gateStateListener)
     }
 
     private fun openGate() {

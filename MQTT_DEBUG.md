@@ -9,9 +9,12 @@ Documentation of `mosquitto_pub` and `mosquitto_sub` commands to emulate ESP32 a
 - **ACK topic**: `opengate/ack` (QoS 0)
 - **GPS topic**: `opengate/gps` (QoS 0, published by the Android app, read by the
   ESP32 only while a proximity window is open)
+- **Gate state topic**: `opengate/gate_state` (QoS 1, published by the ESP32,
+  read by the Android app)
 - **Command format**: `{"id":"<uuid>","command":"<command-name>"}`
 - **ACK format**: `{"id":"<uuid>","result":"<result-code>","timestamp":"<iso-timestamp>"}`
 - **GPS format**: `{"id":"<session-uuid>","seq":<n>,"lat":<deg>,"lon":<deg>,"accuracy":<m>,"speed":<m/s>,"timestamp":"<iso-timestamp>"}`
+- **Gate state format**: `{"state":"waiting"}` or `{"state":"open"}`
 
 ## Supported Commands
 
@@ -174,6 +177,37 @@ The ESP32 subscribes to this topic too, but only between an `OPEN` and the end
 of the five-minute window — subscribing at QoS 0 means the broker never queues
 positions for it while it sleeps, so it can never wake up to a flood of stale
 coordinates.
+
+### Push a Gate State
+
+The app subscribes to `opengate/gate_state` and shows it in the phone UI:
+`unknown` in grey until the first message, `waiting` in yellow, `open` in green.
+An `open` also ends the GPS stream early — there is nothing left to follow.
+
+```bash
+# Proximity window armed, the ESP32 is waiting for the car
+mosquitto_pub \
+  -h <region>.hivemq.cloud \
+  -p 8883 \
+  -u <username> \
+  -P <password> \
+  -t opengate/gate_state \
+  -q 1 \
+  -m '{"state":"waiting"}'
+
+# Gate opened: the app stops publishing its position
+mosquitto_pub \
+  -h <region>.hivemq.cloud \
+  -p 8883 \
+  -u <username> \
+  -P <password> \
+  -t opengate/gate_state \
+  -q 1 \
+  -m '{"state":"open"}'
+```
+
+The app forgets the state on every new `OPEN` command, so a stale `open` from
+the previous run cannot cut the next GPS session short.
 
 ---
 

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Gate state shown by MainActivity. The yellow and the green are darkened
+         from the pure hues, which are unreadable on a white background. -->
+    <color name="gate_state_unknown">#757575</color>
+    <color name="gate_state_waiting">#F9A825</color>
+    <color name="gate_state_open">#2E7D32</color>
+</resources>
