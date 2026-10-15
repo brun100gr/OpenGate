@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var countdownText: TextView
     private lateinit var gateStateText: TextView
     private lateinit var distanceText: TextView
+    private lateinit var distanceReceivedText: TextView
     private lateinit var openButton: Button
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -59,6 +60,16 @@ class MainActivity : Activity() {
         gateStateText.setTextColor(ContextCompat.getColor(this, color))
     }
 
+    private val distanceReceivedListener = GateStateMonitor.OnDistanceReceivedListener { distanceMeters ->
+        val textStr = if (distanceMeters >= 1000) {
+            getString(R.string.distance_received_format_km, distanceMeters / 1000.0)
+        } else {
+            getString(R.string.distance_received_format, distanceMeters)
+        }
+        distanceReceivedText.text = textStr
+        distanceReceivedText.setTextColor(getDistanceColor(distanceMeters))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -69,6 +80,7 @@ class MainActivity : Activity() {
         countdownText = findViewById(R.id.countdownText)
         gateStateText = findViewById(R.id.gateStateText)
         distanceText = findViewById(R.id.distanceText)
+        distanceReceivedText = findViewById(R.id.distanceReceivedText)
         openButton = findViewById(R.id.openButton)
         openButton.setOnClickListener { openGate() }
     }
@@ -77,6 +89,7 @@ class MainActivity : Activity() {
         super.onStart()
         GpsTrackingService.addOnCountdownListener(countdownListener)
         GateStateMonitor.addListener(gateStateListener)
+        GateStateMonitor.addDistanceListener(distanceReceivedListener)
         startLocationUpdates()
     }
 
@@ -84,6 +97,7 @@ class MainActivity : Activity() {
         super.onStop()
         GpsTrackingService.removeOnCountdownListener(countdownListener)
         GateStateMonitor.removeListener(gateStateListener)
+        GateStateMonitor.removeDistanceListener(distanceReceivedListener)
         stopLocationUpdates()
     }
 

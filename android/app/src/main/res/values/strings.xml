@@ -26,4 +26,9 @@
     <string name="distance_calculating">Calculating distance…</string>
     <string name="distance_format">Distance: %1$.0f m</string>
     <string name="distance_format_km">Distance: %1$.2f km</string>
+
+    <!-- Distance received via MQTT topic opengate/distance_received -->
+    <string name="distance_received_placeholder">Received distance: -.-</string>
+    <string name="distance_received_format">Received distance: %1$.0f m</string>
+    <string name="distance_received_format_km">Received distance: %1$.2f km</string>
 </resources>

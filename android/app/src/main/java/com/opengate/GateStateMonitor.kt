@@ -31,22 +31,22 @@ enum class GateState {
 }
 
 /**
- * Subscribes to [Config.STATE_TOPIC] and publishes the gate state to whoever is
- * listening.
+ * Subscribes to [Config.STATE_TOPIC] and [Config.DISTANCE_RECEIVED_TOPIC]
+ * and publishes state and distance updates to whoever is listening.
  *
  * The connection follows the listeners: it is opened when the first one
  * registers and closed when the last one leaves, so the broker is only kept on
  * the line while somebody cares — the phone UI on screen, or a running
  * [GpsTrackingService].
- *
- * The state is deliberately not persisted across commands: [reset] wipes it
- * when a new OPEN command goes out, otherwise a stale [GateState.OPEN] from the
- * previous session would cut the new position stream short.
  */
 object GateStateMonitor {
 
     fun interface OnGateStateListener {
         fun onGateStateChanged(state: GateState)
+    }
+
+    fun interface OnDistanceReceivedListener {
+        fun onDistanceReceived(distanceMeters: Double)
     }
 
     private const val TAG = "GateStateMonitor"
@@ -61,35 +61,43 @@ object GateStateMonitor {
     private val executor = Executors.newSingleThreadScheduledExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val listeners = CopyOnWriteArrayList<OnGateStateListener>()
+    private val distanceListeners = CopyOnWriteArrayList<OnDistanceReceivedListener>()
 
     private val _state = MutableStateFlow(GateState.UNKNOWN)
     val state: StateFlow<GateState> = _state.asStateFlow()
+
+    private val _receivedDistance = MutableStateFlow<Double?>(null)
+    val receivedDistance: StateFlow<Double?> = _receivedDistance.asStateFlow()
 
     private var client: MqttClient? = null
     private var retry: ScheduledFuture<*>? = null
 
     private val callback = object : MqttCallbackExtended {
         override fun connectComplete(reconnect: Boolean, serverURI: String?) {
-            // Only the automatic reconnects are handled here — the first
-            // subscription is issued by ensureConnected(). The work is handed
-            // to the executor because this runs on the Paho callback thread,
-            // the very thread that would have to deliver the SUBACK: blocking
-            // it with a synchronous subscribe() deadlocks the client for good.
-            if (reconnect) {
-                Log.d(TAG, "Reconnected to $serverURI, resubscribing")
-                executor.execute { subscribe() }
-            }
+            Log.d(TAG, "Connect complete (reconnect=$reconnect) to $serverURI")
+            executor.execute { subscribe() }
         }
 
         override fun messageArrived(topic: String?, message: MqttMessage?) {
             val payload = message?.payload?.toString(Charsets.UTF_8) ?: return
-            Log.d(TAG, "Received on $topic: $payload")
-            parseState(payload)?.let { publishState(it) }
+            Log.d(TAG, "Message arrived on topic [$topic]: '$payload'")
+
+            if (topic.equals(Config.STATE_TOPIC, ignoreCase = true)) {
+                val newState = parseState(payload)
+                Log.d(TAG, "Parsed gate state: $newState from payload '$payload'")
+                if (newState != null) {
+                    publishState(newState)
+                }
+            } else if (topic.equals(Config.DISTANCE_RECEIVED_TOPIC, ignoreCase = true)) {
+                val distance = parseDistance(payload)
+                Log.d(TAG, "Parsed distance: $distance from payload '$payload'")
+                if (distance != null) {
+                    publishReceivedDistance(distance)
+                }
+            }
         }
 
         override fun connectionLost(cause: Throwable?) {
-            // isAutomaticReconnect takes it from here; the periodic check below
-            // is the safety net for a connection that never came up at all.
             Log.w(TAG, "Connection lost: ${cause?.message}")
         }
 
@@ -99,25 +107,22 @@ object GateStateMonitor {
     /** Must run on [executor]: it blocks until the broker answers. */
     private fun subscribe() {
         val mqttClient = client ?: return
+        if (!mqttClient.isConnected) return
+
+        subscribeToTopic(mqttClient, Config.STATE_TOPIC)
+        subscribeToTopic(mqttClient, Config.DISTANCE_RECEIVED_TOPIC)
+    }
+
+    private fun subscribeToTopic(mqttClient: MqttClient, topicName: String) {
         try {
-            val token = mqttClient.subscribeWithResponse(Config.STATE_TOPIC, 1)
-            // A SUBACK can succeed at the protocol level and still refuse the
-            // subscription: 0x80 means the broker does not let these
-            // credentials read the topic, and no message will ever arrive.
+            val token = mqttClient.subscribeWithResponse(topicName, 1)
             if (token.grantedQos.any { it == SUBSCRIPTION_REFUSED }) {
-                Log.e(
-                    TAG,
-                    "Broker refused the subscription to ${Config.STATE_TOPIC} " +
-                        "for user ${Config.USERNAME}: check the topic permissions"
-                )
+                Log.e(TAG, "Broker refused subscription to $topicName for user ${Config.USERNAME}")
             } else {
-                Log.d(
-                    TAG,
-                    "Subscribed to ${Config.STATE_TOPIC}, granted QoS ${token.grantedQos.joinToString()}"
-                )
+                Log.d(TAG, "Subscribed successfully to $topicName (granted QoS ${token.grantedQos.joinToString()})")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Could not subscribe to ${Config.STATE_TOPIC}", e)
+            Log.e(TAG, "Error subscribing to $topicName", e)
         }
     }
 
@@ -129,7 +134,20 @@ object GateStateMonitor {
 
     fun removeListener(listener: OnGateStateListener) {
         listeners.remove(listener)
-        executor.execute { if (listeners.isEmpty()) stopWatching() }
+        executor.execute { if (listeners.isEmpty() && distanceListeners.isEmpty()) stopWatching() }
+    }
+
+    fun addDistanceListener(listener: OnDistanceReceivedListener) {
+        distanceListeners.add(listener)
+        _receivedDistance.value?.let { distance ->
+            mainHandler.post { listener.onDistanceReceived(distance) }
+        }
+        executor.execute { startWatching() }
+    }
+
+    fun removeDistanceListener(listener: OnDistanceReceivedListener) {
+        distanceListeners.remove(listener)
+        executor.execute { if (listeners.isEmpty() && distanceListeners.isEmpty()) stopWatching() }
     }
 
     /** Forgets the last known state: called when a new OPEN command is sent. */
@@ -140,38 +158,74 @@ object GateStateMonitor {
     private fun publishState(newState: GateState) {
         if (_state.value == newState) return
         _state.value = newState
-        Log.d(TAG, "Gate state: $newState")
+        Log.d(TAG, "Gate state published: $newState")
         for (listener in listeners) {
-            // Callbacks arrive on the MQTT thread, listeners update the UI
             mainHandler.post { listener.onGateStateChanged(newState) }
         }
     }
 
+    private fun publishReceivedDistance(distance: Double) {
+        _receivedDistance.value = distance
+        Log.d(TAG, "Received distance published: $distance m")
+        for (listener in distanceListeners) {
+            mainHandler.post { listener.onDistanceReceived(distance) }
+        }
+    }
+
     private fun parseState(payload: String): GateState? {
-        val raw = try {
-            JSONObject(payload).optString("state")
-        } catch (e: Exception) {
-            Log.w(TAG, "Malformed payload: $payload")
-            return null
+        val trimmed = payload.trim()
+        val raw = if (trimmed.startsWith("{")) {
+            try {
+                val json = JSONObject(trimmed)
+                if (json.has("state")) {
+                    json.optString("state")
+                } else if (json.has("status")) {
+                    json.optString("status")
+                } else if (json.has("gate")) {
+                    json.optString("gate")
+                } else {
+                    trimmed
+                }
+            } catch (e: Exception) {
+                trimmed
+            }
+        } else {
+            trimmed
         }
 
-        return when (raw.lowercase()) {
-            "waiting" -> GateState.WAITING
-            "open" -> GateState.OPEN
-            "unknown" -> GateState.UNKNOWN
-            // A state we do not know about tells us nothing: keep the last one
+        return when (raw.lowercase().trim()) {
+            "waiting", "\"waiting\"" -> GateState.WAITING
+            "open", "\"open\"" -> GateState.OPEN
+            "unknown", "\"unknown\"" -> GateState.UNKNOWN
             else -> {
-                Log.w(TAG, "Unknown state '$raw', ignored")
+                Log.w(TAG, "Unknown state '$raw' in payload '$payload'")
                 null
             }
         }
+    }
+
+    private fun parseDistance(payload: String): Double? {
+        val trimmed = payload.trim()
+        if (trimmed.startsWith("{")) {
+            try {
+                val json = JSONObject(trimmed)
+                if (json.has("distance")) return json.getDouble("distance")
+                if (json.has("dist")) return json.getDouble("dist")
+                if (json.has("value")) return json.getDouble("value")
+                if (json.has("meters")) return json.getDouble("meters")
+            } catch (e: Exception) {
+                Log.w(TAG, "Malformed JSON distance payload: $payload")
+            }
+        }
+        val cleanStr = trimmed.replace("\"", "").replace("m", "").trim()
+        return cleanStr.toDoubleOrNull()
     }
 
     private fun startWatching() {
         ensureConnected()
         if (retry == null) {
             retry = executor.scheduleWithFixedDelay(
-                { if (listeners.isNotEmpty()) ensureConnected() },
+                { if (listeners.isNotEmpty() || distanceListeners.isNotEmpty()) ensureConnected() },
                 RETRY_INTERVAL_S,
                 RETRY_INTERVAL_S,
                 TimeUnit.SECONDS
@@ -188,7 +242,6 @@ object GateStateMonitor {
 
     private fun ensureConnected() {
         if (client?.isConnected == true) return
-        // A client left over from a failed attempt would leak its resources
         closeQuietly()
 
         try {
@@ -204,11 +257,9 @@ object GateStateMonitor {
                 password = Config.PASSWORD.toCharArray()
                 isCleanSession = true
                 connectionTimeout = 10
-                // The phone is moving: mobile coverage is expected to drop out
                 isAutomaticReconnect = true
             }
 
-            // Assigned first: connectComplete() fires from inside connect()
             client = mqttClient
             mqttClient.connect(options)
             Log.d(TAG, "Connected to broker as ${Config.USERNAME}")
