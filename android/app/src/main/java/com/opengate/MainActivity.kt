@@ -58,6 +58,10 @@ class MainActivity : Activity() {
         }
         gateStateText.text = getString(label)
         gateStateText.setTextColor(ContextCompat.getColor(this, color))
+
+        if (state == GateState.WAITING) {
+            startGpsTracking()
+        }
     }
 
     private val distanceReceivedListener = GateStateMonitor.OnDistanceReceivedListener { distanceMeters ->

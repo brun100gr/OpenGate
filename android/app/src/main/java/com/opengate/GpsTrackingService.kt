@@ -77,12 +77,23 @@ class GpsTrackingService : Service() {
     /**
      * The gate is open: the ESP32 has no use for the position any more, so the
      * session ends early instead of running the full five minutes.
+     * When state is WAITING, the countdown resets back to 5 minutes.
      */
     private val gateStateListener = GateStateMonitor.OnGateStateListener { state ->
         if (state == GateState.OPEN && tracking) {
             Log.d(TAG, "Gate reported open, stopping the GPS stream")
             stopSelf()
+        } else if (state == GateState.WAITING) {
+            Log.d(TAG, "Gate reported WAITING, resetting countdown to 5 minutes")
+            resetCountdown()
         }
+    }
+
+    private fun resetCountdown() {
+        deadline = SystemClock.elapsedRealtime() + SESSION_DURATION_MS
+        val initialSeconds = (SESSION_DURATION_MS / 1000).toInt()
+        notifyCountdown(initialSeconds)
+        updateNotification(initialSeconds)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
