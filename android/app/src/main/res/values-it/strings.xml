@@ -27,8 +27,8 @@
     <string name="distance_format">Distanza da casa: %1$.0f m</string>
     <string name="distance_format_km">Distanza da casa: %1$.2f km</string>
 
-    <!-- Distance received via MQTT topic opengate/distance_received -->
-    <string name="distance_received_placeholder">Distanza ricevuta: -.-</string>
-    <string name="distance_received_format">Distanza ricevuta: %1$.0f m</string>
-    <string name="distance_received_format_km">Distanza ricevuta: %1$.2f km</string>
+    <!-- Distance received via MQTT topic opengate/distance_device -->
+    <string name="distance_device_placeholder">Distanza ricevuta: -.-</string>
+    <string name="distance_device_format">Distanza ricevuta: %1$.0f m</string>
+    <string name="distance_device_format_km">Distanza ricevuta: %1$.2f km</string>
 </resources>

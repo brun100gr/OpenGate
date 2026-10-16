@@ -62,9 +62,9 @@ class MainActivity : Activity() {
 
     private val distanceReceivedListener = GateStateMonitor.OnDistanceReceivedListener { distanceMeters ->
         val textStr = if (distanceMeters >= 1000) {
-            getString(R.string.distance_received_format_km, distanceMeters / 1000.0)
+            getString(R.string.distance_device_format_km, distanceMeters / 1000.0)
         } else {
-            getString(R.string.distance_received_format, distanceMeters)
+            getString(R.string.distance_device_format, distanceMeters)
         }
         distanceReceivedText.text = textStr
         distanceReceivedText.setTextColor(getDistanceColor(distanceMeters))

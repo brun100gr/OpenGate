@@ -35,3 +35,4 @@ local/venv/
 local/__pycache__/
 local/*.py[cod]
 local/esp32_nvs_sim.json
+esp32/opengate/esp32.code-workspace

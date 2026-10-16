@@ -68,6 +68,9 @@ before deploying to production.
    If you *did* restrict permissions per topic, remember to allow
    `opengate-app` to publish on `opengate/gps` as well, not just on
    `opengate/cmd` — otherwise the position stream is rejected silently.
+   The ESP32 also publishes its filtered approach distance on
+   `opengate/distance_device`; allow `opengate-esp32` to publish there and
+   `opengate-app` to subscribe there if your ACLs restrict topics.
 
 ## 2. Android App
 
@@ -85,6 +88,22 @@ the proper SDK and JDK on its own).
 3. Connect the phone via USB (with **USB debugging** enabled in developer
    options) and press **Run ▶**. The app appears on the phone: a single
    "Open gate" button.
+
+### Gate State Updates
+The Android app receives updates on the `opengate/gate_state` topic. The
+payload can be plain text containing only the state (`open`), or a JSON string
+with a key-value pair, for example `{"state":"waiting"}`. The recognized
+states are `waiting`, `open`, and `unknown`.
+
+```sh
+# Plain text
+mosquitto_pub -h YOUR_CLUSTER.s1.eu.hivemq.cloud -p 8883 --capath /etc/ssl/certs \
+   -u YOUR_USERNAME -P 'YOUR_PASSWORD' -t opengate/gate_state -m 'open'
+
+# JSON format
+mosquitto_pub -h YOUR_CLUSTER.s1.eu.hivemq.cloud -p 8883 --capath /etc/ssl/certs \
+   -u YOUR_USERNAME -P 'YOUR_PASSWORD' -t opengate/gate_state -m '{"state":"waiting"}'
+```
 
 ### GPS Position Streaming
 
@@ -170,6 +189,11 @@ gaps: `seq` tells the sketch exactly how many messages went missing, and it
 extrapolates across them while widening its own uncertainty, so the next real
 fix counts for more. Two consecutive confirmations inside the radius are
 required before the relay moves.
+
+While the ESP32 is waiting for the phone, each valid GPS fix produces a QoS 0
+message on `opengate/distance_device`, with the filtered distance in metres:
+`{"distance":123.45}`. The topic is published only during the armed tracking
+window while position fixes are being received.
 
 `GATE_LATITUDE` / `GATE_LONGITUDE` are the centre of that circle. Read them off
 a map by right-clicking your gate (Google Maps → "What's here?" shows decimal

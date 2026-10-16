@@ -111,6 +111,7 @@ const char* MQTT_CMD_TOPIC = "opengate/cmd";
 const char* MQTT_ACK_TOPIC = "opengate/ack";
 const char* MQTT_GPS_TOPIC = "opengate/gps";
 const char* MQTT_STATE_TOPIC = "opengate/gate_state";
+const char* MQTT_DISTANCE_DEVICE_TOPIC = "opengate/distance_device";
 const int MQTT_CONNECT_ATTEMPTS = 3;
 const unsigned long MQTT_RETRY_DELAY_MS = 1000;
 const uint16_t MQTT_KEEPALIVE_S = 30;
@@ -940,6 +941,26 @@ void publishGateState(const char* state) {
   }
 }
 
+// Publishes the filtered phone-to-gate distance while the proximity window is
+// active. Like gate state, this is a best-effort QoS 0 update.
+void publishDistanceReceived(double distance) {
+  if (!mqtt.connected()) {
+    Serial.println("[DISTANCE] MQTT not connected, distance not published");
+    return;
+  }
+
+  char payload[64];
+  snprintf(payload, sizeof(payload), "{\"distance_device\":%.2f}", distance);
+
+  if (mqtt.publish(MQTT_DISTANCE_DEVICE_TOPIC, payload, false)) {
+    Serial.printf("[DISTANCE] Published on %s: %s\r\n",
+                  MQTT_DISTANCE_DEVICE_TOPIC, payload);
+  } else {
+    Serial.printf("[DISTANCE] Failed to publish on %s: %s\r\n",
+                  MQTT_DISTANCE_DEVICE_TOPIC, payload);
+  }
+}
+
 // ======================== MQTT callback ========================
 // Keep this function as short as possible: PubSubClient writes the QoS 1 PUBACK
 // only after it returns (see PubSubClient::loop, MQTTPUBLISH branch). Messages
@@ -1343,6 +1364,7 @@ bool consumeFix(const GpsFix& fix) {
   gpsFixesUsed++;
 
   const double distance = filteredDistanceM();
+  publishDistanceReceived(distance);
   if (bestDistanceM < 0.0 || distance < bestDistanceM) {
     bestDistanceM = distance;
   }

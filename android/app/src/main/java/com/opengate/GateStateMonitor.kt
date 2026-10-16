@@ -31,7 +31,7 @@ enum class GateState {
 }
 
 /**
- * Subscribes to [Config.STATE_TOPIC] and [Config.DISTANCE_RECEIVED_TOPIC]
+ * Subscribes to [Config.STATE_TOPIC] and [Config.DISTANCE_DEVICE_TOPIC]
  * and publishes state and distance updates to whoever is listening.
  *
  * The connection follows the listeners: it is opened when the first one
@@ -88,7 +88,7 @@ object GateStateMonitor {
                 if (newState != null) {
                     publishState(newState)
                 }
-            } else if (topic.equals(Config.DISTANCE_RECEIVED_TOPIC, ignoreCase = true)) {
+            } else if (topic.equals(Config.DISTANCE_DEVICE_TOPIC, ignoreCase = true)) {
                 val distance = parseDistance(payload)
                 Log.d(TAG, "Parsed distance: $distance from payload '$payload'")
                 if (distance != null) {
@@ -110,7 +110,7 @@ object GateStateMonitor {
         if (!mqttClient.isConnected) return
 
         subscribeToTopic(mqttClient, Config.STATE_TOPIC)
-        subscribeToTopic(mqttClient, Config.DISTANCE_RECEIVED_TOPIC)
+        subscribeToTopic(mqttClient, Config.DISTANCE_DEVICE_TOPIC)
     }
 
     private fun subscribeToTopic(mqttClient: MqttClient, topicName: String) {
@@ -209,6 +209,7 @@ object GateStateMonitor {
         if (trimmed.startsWith("{")) {
             try {
                 val json = JSONObject(trimmed)
+                if (json.has("distance_device")) return json.getDouble("distance_device")
                 if (json.has("distance")) return json.getDouble("distance")
                 if (json.has("dist")) return json.getDouble("dist")
                 if (json.has("value")) return json.getDouble("value")
