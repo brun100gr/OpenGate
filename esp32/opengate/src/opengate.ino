@@ -1,8 +1,8 @@
 /*
  * OpenGate — gate side (ESP32)
  *
- * Wakes from deep sleep every DEEP_SLEEP_SECONDS, connects to WiFi and MQTT and
- * collects the commands the broker has queued.
+ * Wakes from deep sleep on five-minute clock boundaries, connects to WiFi and
+ * MQTT and collects the commands the broker has queued.
  *
  * An OPEN command does NOT move the gate. It ARMS a proximity window: the ESP32
  * stays awake for TRACKING_WINDOW_MS following the phone position published on
@@ -100,6 +100,7 @@
 #include <UniversalTelegramBot.h>
 #include <ESP32Servo.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "certificates.h"
 #include "secrets.h"
@@ -150,11 +151,8 @@ const unsigned long TIME_SYNC_TIMEOUT_MS = 5000;
 const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; only used as a sanity check
 
 // --- Deep sleep ---
-// Deliberately NOT raised to 300 s: the phone streams its position for five
-// minutes from the button press, so a five-minute sleep would routinely wake the
-// ESP32 after that window had already expired, leaving it nothing to track.
-const uint32_t DEEP_SLEEP_SECONDS = 120;
-const uint64_t DEEP_SLEEP_DURATION_US = (uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL;
+// The sleep duration is adjusted to wake on each five-minute wall-clock boundary.
+const uint32_t DEEP_SLEEP_SECONDS = 300;
 
 // --- Command collection (phase 1) ---
 // The collection loop waits up to MQTT_COLLECT_IDLE_MS for the first message;
@@ -1558,9 +1556,23 @@ void recoverPendingCommand() {
 // ========================= Setup & loop ========================
 
 void enterDeepSleep() {
-  Serial.printf("\r\n[Sleep] Going to deep sleep for %u s...\r\n", DEEP_SLEEP_SECONDS);
+  uint64_t sleepDurationUs = (uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL;
+  struct timeval now;
+
+  if (gettimeofday(&now, nullptr) == 0 && now.tv_sec >= MIN_VALID_EPOCH) {
+    const uint64_t intervalUs = (uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL;
+    const uint64_t elapsedUs = ((uint64_t)now.tv_sec % DEEP_SLEEP_SECONDS) * 1000000ULL
+      + (uint64_t)now.tv_usec;
+    sleepDurationUs = intervalUs - elapsedUs;
+    Serial.printf("\r\n[Sleep] Going to deep sleep for %llu.%06llu s, until the next 5-minute boundary...\r\n",
+      (unsigned long long)(sleepDurationUs / 1000000ULL),
+      (unsigned long long)(sleepDurationUs % 1000000ULL));
+  } else {
+    Serial.printf("\r\n[Sleep] System time unavailable; going to deep sleep for %u s...\r\n", DEEP_SLEEP_SECONDS);
+  }
+
   Serial.flush();
-  esp_deep_sleep(DEEP_SLEEP_DURATION_US);
+  esp_deep_sleep(sleepDurationUs);
 }
 
 // The whole MQTT part of a wake, from recovery to disconnection.
